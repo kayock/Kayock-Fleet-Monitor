@@ -219,7 +219,19 @@ Local runtime configuration files (`fleet.json`, `ai_servers.json`, `monitor_con
 
 ## Screenshots
 
-Screenshots of the running fleet dashboard, loaded model inventory and hardware/GPU panels are welcome. Before publishing screenshots, hide personal browser tabs, hostnames and local addresses if you don't want them publicly visible. Add images under `docs/screenshots/` and link them here. Screenshots should show real application output, not mock data presented as live metrics.
+Real captures from the three-machine fleet. Browser tabs are cropped out, and private LAN addresses are blurred in the fleet overview. The AI server inventory screenshot is deferred until its probe errors are fixed.
+
+### Connected fleet — Windows, Station, and Portable
+
+![Three machines connected to Kayock Fleet Monitor](docs/screenshots/fleet-overview.png)
+
+### Ubuntu Portable performance
+
+![Ubuntu Portable CPU and memory charts](docs/screenshots/portable-performance.png)
+
+### Windows Intel GPU and system I/O
+
+![Windows Intel UHD 770, storage, and network metrics](docs/screenshots/windows-gpu-storage-network.png)
 
 ## License
 
