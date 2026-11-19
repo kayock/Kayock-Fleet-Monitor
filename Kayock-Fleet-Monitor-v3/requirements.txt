@@ -1,0 +1,6 @@
+# Windows System Monitor — runtime dependencies
+Flask>=3.0,<4.0
+psutil>=5.9.5,<8.0
+
+# Test-only dependency (needed to run the automated tests in tests/):
+pytest>=7.4,<10.0

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Windows System Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script>
+    // Injected server constants (single source of truth for the browser loop)
+    window.MONITOR_CONFIG = {
+      refreshMs: {{ refresh_ms }},
+      historyLen: {{ history_len }}
+    };
+  </script>
+  <script src="{{ url_for('static', filename='js/plotly.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</head>
+<body>
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-title">Kayock Fleet Monitor</div>
+    <div class="loading-sub">Collecting the first sample…</div>
+  </div>
+
+  <div id="error-banner" hidden>
+    <span>⚠ <span id="error-text">Connection lost — retrying…</span></span>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <h1>Kayock Fleet Monitor</h1>
+      <span class="sub">system · AI servers · fleet · offline · v{{ app_version }}</span>
+    </div>
+    <div class="meta-chips">
+      <span class="chip" id="host-name">—</span>
+      <span class="chip" id="os-name">—</span>
+      <span class="chip" id="os-version">—</span>
+      <span class="chip" id="os-arch">—</span>
+      <span class="chip" id="python-version">—</span>
+    </div>
+    <div class="live">
+      <div class="live-item"><span class="label">Uptime</span><span class="value" id="uptime">—</span></div>
+      <div class="live-item"><span class="label">Local time</span><span class="value" id="clock">—</span></div>
+    </div>
+  </header>
+
+  <nav class="machine-tabs" id="machine-tabs">
+    <button class="tab machine-tab active" data-view="all" type="button">All Machines</button>
+    <button class="tab machine-tab" data-view="self" type="button" id="tab-self">This machine ({{ machine_label }})</button>
+    <!-- fleet machine tabs are rendered here by app.js -->
+  </nav>
+  <div class="machine-view-head" id="machine-view-head" hidden>
+    <span id="machine-view-title" class="name">—</span>
+    <span id="machine-view-note" class="mini"></span>
+  </div>
+
+  <!-- ===== All Machines (fleet overview) ===== -->
+  <div id="view-all">
+    <section class="card" id="card-overview">
+      <div class="card-head">
+        <h2>All Machines</h2>
+        <div class="headline">
+          <span class="status-chip" id="fleet-poll-status">polling…</span>
+          <span class="sort-tabs">
+            <button id="fleet-discover-btn" class="tab" type="button">⟳ Scan LAN</button>
+            <button id="fleet-add" class="tab" type="button">+ Add machine</button>
+          </span>
+        </div>
+      </div>
+      <div class="note" id="fleet-note"></div>
+      <div id="overview-grid" class="overview-grid"></div>
+      <div id="discovered-panel"></div>
+    </section>
+
+    <section class="card card-ai" id="card-inventory">
+      <div class="card-head">
+        <h2>Fleet AI Model Inventory</h2>
+        <div class="headline">
+          <span class="sort-tabs">
+            <input id="inventory-search" class="search-input" type="search"
+                   placeholder="search model, server, machine…" autocomplete="off">
+            <select id="inventory-filter" class="ai-model-select">
+              <option value="all">all states</option>
+              <option value="ready">ready</option>
+              <option value="online">online</option>
+              <option value="busy">busy</option>
+              <option value="loading">loading</option>
+              <option value="offline">offline</option>
+              <option value="error">error</option>
+            </select>
+          </span>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="tbl inventory-table">
+          <thead>
+            <tr><th>Machine</th><th>Server</th><th>Type</th><th>Model</th>
+                <th>Status</th><th>CPU</th><th>RAM</th><th>VRAM</th>
+                <th>tok/s</th><th>Act</th><th>Controls</th></tr>
+          </thead>
+          <tbody id="inventory-tbody">
+            <tr><td colspan="11" class="note">waiting for fleet data…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">Remote controls appear only for machines where you explicitly enabled remote control in the machine's configuration.</div>
+    </section>
+  </div>
+
+  <!-- ===== System + local AI servers (this machine OR a fleet machine) ===== -->
+  <div id="view-machine">
+  <main class="grid">
+
+    <!-- CPU -->
+    <section class="card card-cpu" id="card-cpu">
+      <div class="card-head">
+        <h2>CPU</h2>
+        <div class="headline">
+          <span class="big-value" id="cpu-percent">—</span>
+          <span class="side">
+            <span id="cpu-clock" class="value">—</span>
+            <span class="mini" id="cpu-logical">—</span>
+            <span class="mini" id="cpu-physical"></span>
+          </span>
+        </div>
+      </div>
+      <div class="core-grid" id="cpu-cores"></div>
+      <div class="note" id="cpu-clock-note"></div>
+      <div class="chart" id="cpu-chart"></div>
+    </section>
+
+    <!-- Memory -->
+    <section class="card" id="card-memory">
+      <div class="card-head">
+        <h2>Memory</h2>
+        <div class="headline">
+          <span class="big-value" id="mem-percent">—</span>
+        </div>
+      </div>
+      <div class="bar-wrap"><div class="bar-fill mem" id="mem-bar"></div></div>
+      <table class="kv">
+        <tbody>
+          <tr><td>Total</td><td id="mem-total">—</td></tr>
+          <tr><td>Used</td><td id="mem-used">—</td></tr>
+          <tr><td>Available</td><td id="mem-available">—</td></tr>
+          <tr><td>Swap used</td><td id="swap-used">— <span class="mini" id="swap-percent"></span></td></tr>
+        </tbody>
+      </table>
+      <div class="chart" id="mem-chart"></div>
+    </section>
+
+    <!-- GPU -->
+    <section class="card" id="card-gpu">
+      <div class="card-head">
+        <h2>GPU</h2>
+        <div class="headline">
+          <span class="big-value" id="gpu-util">—</span>
+          <span class="status-chip" id="gpu-status">detecting…</span>
+        </div>
+      </div>
+      <div id="gpu-adapters" class="adapter-list"></div>
+      <div class="note" id="gpu-util-note"></div>
+      <div class="chip-row" id="gpu-engines"></div>
+      <table class="kv">
+        <tbody>
+          <tr><td>Driver</td><td id="gpu-driver">—</td></tr>
+          <tr><td>Memory</td><td id="gpu-vram">—</td></tr>
+          <tr><td>Temperature</td><td id="gpu-temp">—</td></tr>
+        </tbody>
+      </table>
+      <div class="chart" id="gpu-chart"></div>
+      <div class="note" id="gpu-extra"></div>
+    </section>
+
+    <!-- Storage -->
+    <section class="card" id="card-storage">
+      <div class="card-head">
+        <h2>Storage</h2>
+        <div class="headline">
+          <span class="side rate-pair">
+            <span class="rate read" id="disk-read">—</span>
+            <span class="rate write" id="disk-write">—</span>
+          </span>
+        </div>
+      </div>
+      <div class="note">
+        I/O rates are real bytes/sec measured from counter deltas; space is
+        capacity. <span id="disk-io-note"></span>
+      </div>
+      <div class="table-scroll">
+        <table class="tbl">
+          <thead><tr><th>Volume</th><th>File system</th><th>Total</th><th>Used</th><th>Free</th><th>Use</th></tr></thead>
+          <tbody id="volumes-tbody"></tbody>
+        </table>
+      </div>
+      <div class="note" id="volumes-note"></div>
+      <div class="mini" id="disk-totals"></div>
+      <div class="chart" id="disk-chart"></div>
+    </section>
+
+    <!-- Network -->
+    <section class="card" id="card-network">
+      <div class="card-head">
+        <h2>Network</h2>
+        <div class="headline">
+          <span class="side rate-pair">
+            <span class="rate down" id="net-down">—</span>
+            <span class="rate up" id="net-up">—</span>
+          </span>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="tbl">
+          <thead><tr><th>Adapter</th><th>↓ rate</th><th>↑ rate</th><th>↓ total</th><th>↑ total</th></tr></thead>
+          <tbody id="net-tbody"></tbody>
+        </table>
+      </div>
+      <div class="note" id="net-note">Rates are bytes/sec deltas; totals are cumulative since boot.</div>
+      <div class="chart" id="net-chart"></div>
+    </section>
+
+    <!-- Processes -->
+    <section class="card" id="card-processes">
+      <div class="card-head">
+        <h2>Top processes</h2>
+        <div class="headline">
+          <span class="mini" id="proc-count">—</span>
+          <span class="sort-tabs">
+            <button id="sort-cpu" class="tab active" type="button">by CPU</button>
+            <button id="sort-mem" class="tab" type="button">by memory</button>
+          </span>
+        </div>
+      </div>
+      <div class="table-scroll proc-scroll">
+        <table class="tbl">
+          <thead><tr><th>PID</th><th>Name</th><th>CPU %</th><th>Memory %</th><th>RAM</th></tr></thead>
+          <tbody id="proc-tbody"></tbody>
+        </table>
+      </div>
+      <div class="note" id="proc-note"></div>
+    </section>
+
+    <!-- AI Model Servers -->
+    <section class="card card-ai" id="card-ai">
+      <div class="card-head">
+        <h2>AI Model Servers</h2>
+        <div class="headline">
+          <span class="status-chip" id="ai-discovery-status">scanning…</span>
+          <span class="sort-tabs">
+            <button id="ai-refresh" class="tab" type="button">⟳ Refresh discovery</button>
+            <button id="ai-add" class="tab" type="button">+ Add server</button>
+          </span>
+        </div>
+      </div>
+      <div class="note" id="ai-note"></div>
+      <div id="ai-servers" class="ai-server-list"></div>
+    </section>
+
+    <!-- Fleet Servers -->
+    <section class="card card-fleet" id="card-fleet">
+      <div class="card-head">
+        <h2>Fleet Servers</h2>
+        <div class="headline">
+          <span class="status-chip" id="fleet-status">idle</span>
+          <span class="sort-tabs">
+            <button id="fleet-add" class="tab" type="button">+ Add machine</button>
+          </span>
+        </div>
+      </div>
+      <div class="note">Optional: point this at other computers running this same monitor (Linux Portable, Ubuntu Station). Nothing is installed remotely; local monitoring works without any fleet entry.</div>
+      <div id="fleet-machines" class="ai-server-list"></div>
+    </section>
+
+  </main>
+  </div><!-- /view-machine -->
+
+  <!-- AI server config modal -->
+  <div class="modal-overlay" id="ai-config-modal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="ai-config-title">Configure AI server</h3>
+        <button class="tab" id="ai-config-close" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="ai-cfg-id">
+        <label>Name <input id="ai-cfg-name" type="text" placeholder="My llama.cpp server"></label>
+        <label>Type
+          <select id="ai-cfg-type">
+            <option value="llama-server">llama.cpp / llama-server</option>
+            <option value="ollama">Ollama</option>
+            <option value="lm-studio">LM Studio</option>
+            <option value="lemonade">Lemonade</option>
+            <option value="vllm">vLLM</option>
+            <option value="sglang">SGLang</option>
+            <option value="openai">Other OpenAI-compatible</option>
+          </select>
+        </label>
+        <label>Host <input id="ai-cfg-host" type="text" value="127.0.0.1"></label>
+        <label>Port <input id="ai-cfg-port" type="number" min="1" max="65535" placeholder="8080"></label>
+        <label>Executable path (optional — required for start/stop)
+          <input id="ai-cfg-exe" type="text" placeholder="C:\llama.cpp\llama-server.exe"></label>
+        <label>Launch arguments
+          <input id="ai-cfg-args" type="text" placeholder='-m "C:\models\model.gguf" -c 4096'></label>
+        <label>Model folder (optional — powers the model picker)
+          <input id="ai-cfg-modeldir" type="text" placeholder="C:\models"></label>
+        <div class="note" id="ai-cfg-warnings"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="tab" id="ai-cfg-save" type="button">Save</button>
+        <button class="tab danger" id="ai-cfg-delete" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fleet machine modal -->
+  <div class="modal-overlay" id="fleet-modal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="fleet-modal-title">Add fleet machine</h3>
+        <button class="tab" id="fleet-close" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="fleet-cfg-id">
+        <label>Name <input id="fleet-cfg-name" type="text" placeholder="Linux Portable"></label>
+        <label>Host <input id="fleet-cfg-host" type="text" placeholder="linux-portable.local or 192.168.1.50"></label>
+        <label>Monitor port <input id="fleet-cfg-port" type="number" min="1" max="65535" placeholder="5000"></label>
+        <label>Note <input id="fleet-cfg-note" type="text" placeholder="runs the same monitor app"></label>
+        <label class="check-row"><input id="fleet-cfg-control" type="checkbox">
+          Allow remote control (start/stop/restart/load/unload of AI servers on
+          this machine — off by default; monitoring always works)</label>
+        <div class="note">The remote machine must run this same monitor; nothing else is installed there and no remote settings are changed.</div>
+      </div>
+      <div class="modal-foot">
+        <button class="tab" id="fleet-cfg-save" type="button">Save</button>
+        <button class="tab danger" id="fleet-cfg-delete" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs modal -->
+  <div class="modal-overlay" id="logs-modal" hidden>
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <h3 id="logs-title">Server output</h3>
+        <button class="tab" id="logs-close" type="button">✕</button>
+      </div>
+      <pre id="logs-content" class="logs">(no output captured yet)</pre>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span id="refresh-note">—</span>
+    <span id="sampler-note"></span>
+  </footer>
+</body>
+</html>
