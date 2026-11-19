@@ -1,0 +1,29 @@
+# Local Python environments & caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+# Runtime configuration – never publish machine-specific settings
+fleet.json
+ai_servers.json
+monitor_config.json
+settings.local.json
+credentials.json
+api_keys.txt
+secrets.yaml
+.env
+.env.*
+# Logs and generated data
+*.log
+logs/
+cache/
+temp/
+tmp/
+test_output/
+.DS_Store
+Thumbs.db

@@ -1,4 +1,4 @@
-# Kayock Fleet Monitor v3
+# Kayock Fleet Monitor
 
 A cross-platform (Windows 11 + Ubuntu Linux) browser dashboard for **system
 health, AI model servers and three-machine fleet monitoring**. Each machine
@@ -11,7 +11,7 @@ dashboard runs fully offline after setup.
 
 ---
 
-## The three target machines
+## Supported platforms (reference deployment)
 
 | Machine | OS | GPU | Role |
 | --- | --- | --- | --- |
@@ -32,8 +32,7 @@ running AI servers). Nothing beyond the table above is assumed.
    `http://127.0.0.1:5000`.
 4. Optional — expose it to the LAN so the Ubuntu machines can monitor it:
    set `"host": "0.0.0.0"` in `monitor_config.json`, or start with
-   `--host 0.0.0.0`. Your Windows firewall may ask for permission once —
-   allow it for private networks.
+   `--host 0.0.0.0`. Allow inbound TCP to the chosen monitor port **from your trusted LAN** in Windows Firewall; LAN listening alone does not bypass a firewall. Keep this dashboard off the public internet.
 
 ### Ubuntu Station / Ubuntu Portable
 1. Extract the folder (e.g. `~/KayockFleetMonitor`).
@@ -53,6 +52,17 @@ running AI servers). Nothing beyond the table above is assumed.
      as unavailable.
 
 ### Connecting the fleet
+
+The monitor's **web port** must be reachable via TCP from other computers. UDP discovery (port 51015) can succeed even if Windows Firewall blocks TCP; a discovered machine is not necessarily reachable. A server may choose a different free port if 5000 is occupied. Use the port actually announced by its monitor, not the AI inference server's port.
+
+For Windows on a trusted home LAN, an administrator may create a local-subnet-only inbound rule for the actual monitor port (example for port 5000):
+
+```powershell
+New-NetFirewallRule -DisplayName "Kayock Fleet Monitor LAN" -Direction Inbound -Protocol TCP -LocalPort 5000 -Action Allow -Profile Any -RemoteAddress LocalSubnet
+```
+
+This does **not** change the Windows network profile or unrelated service rules. Review the rule and restrict its scope as appropriate for your network.
+
 On **each** machine, open the dashboard → **All Machines → + Add machine**
 and add the other two (name + host/IP + monitor port 5000). Or just press
 **⟳ Scan LAN** — instances announce themselves over UDP broadcast (port
@@ -199,3 +209,18 @@ Kayock Fleet Monitor/
   identified shows `ready: unknown` rather than a guessed name.
 * **Server** — Flask's built-in server; bind LAN exposure only on trusted
   networks. The app itself needs no AI model and runs fully offline.
+
+
+## Security and configuration
+
+This application is designed for machines you own on a **trusted LAN**, not for an internet-exposed service. When LAN listening is enabled, HTTP routes (including management routes) are reachable from network clients; the fleet UI's remote-control opt-in is not an authentication mechanism. Do not expose it to the internet or forward its port from a router. Review your firewall rules and network trust before enabling remote access.
+
+Local runtime configuration files (`fleet.json`, `ai_servers.json`, `monitor_config.json`) are excluded from Git. See `fleet.example.json` for a blank fleet file and configure real peers through the UI.
+
+## Screenshots
+
+Screenshots of the running fleet dashboard, loaded model inventory and hardware/GPU panels are welcome. Before publishing screenshots, hide personal browser tabs, hostnames and local addresses if you don't want them publicly visible. Add images under `docs/screenshots/` and link them here. Screenshots should show real application output, not mock data presented as live metrics.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The bundled third-party Plotly.js distribution retains its own upstream license and attribution.
