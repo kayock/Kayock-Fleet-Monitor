@@ -219,7 +219,7 @@ Local runtime configuration files (`fleet.json`, `ai_servers.json`, `monitor_con
 
 ## Screenshots
 
-Real captures from the three-machine fleet. Browser tabs are cropped out, and private LAN addresses are blurred in the fleet overview. The AI server inventory screenshot is deferred until its probe errors are fixed.
+Real captures from the three-machine fleet and an independent community hardware test. Browser tabs are cropped out, and private LAN addresses are blurred in the fleet overview. The AI server inventory screenshot is deferred until its probe errors are fixed.
 
 ### Connected fleet — Windows, Station, and Portable
 
@@ -232,6 +232,12 @@ Real captures from the three-machine fleet. Browser tabs are cropped out, and pr
 ### Windows Intel GPU and system I/O
 
 ![Windows Intel UHD 770, storage, and network metrics](docs/screenshots/windows-gpu-storage-network.png)
+
+### Community test — Windows 11 multi-GPU monitoring
+
+![Windows 11 dashboard detecting two Tesla K80 GPU entries and AMD Radeon Graphics](docs/screenshots/windows-11-triple-gpu-monitoring.webp)
+
+Real-world Ryzen workstation test: the monitor detects **three GPU adapters** (two NVIDIA Tesla K80 entries and AMD Radeon Graphics), alongside live CPU, RAM, storage, and network telemetry. The image is cropped to the dashboard; the original photo is preserved.
 
 ## License
 
