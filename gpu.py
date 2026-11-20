@@ -995,13 +995,13 @@ class GPUCollector:
                                 "grant perf_event_paranoid access)"}
             try:
                 proc = subprocess.run(
-                    [top, "-J", "-s", "1"], capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=4.0,
+                    [top, "-J", "-s", "1000", "-n", "1", "-o", "-"], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=5.0,
                     stdin=subprocess.DEVNULL)
                 out = (proc.stdout or "").strip()
                 if out and proc.returncode == 0:
-                    line = out.splitlines()[0]
-                    data = json.loads(line)
+                    samples = json.loads(out)
+                    data = samples[-1] if isinstance(samples, list) and samples else samples
                     engines = {}
                     for ename, edata in (data.get("engines") or {}).items():
                         busy = (edata or {}).get("busy")
