@@ -120,11 +120,18 @@ def test_intel_gpu_top_json_parsing(monkeypatch):
 
     class FakeProc:
         returncode = 0
-        stdout = json_line = '{"engines": {"Render/3D": {"busy": 12.4}, ' \
-            '"Copy": {"busy": 3.0}, "Video": {"busy": 0.2}}}'
+        # Real intel_gpu_top -J output is a multi-line JSON array.
+        stdout = ('[\n{\n  "period": {"duration": 1000, "unit": "ms"},\n'
+                  '  "engines": {"Render/3D": {"busy": 12.4}, '
+                  '"Copy": {"busy": 3.0}, "Video": {"busy": 0.2}}\n}\n]\n')
 
-    monkeypatch.setattr(gpu_mod.subprocess, "run",
-                        lambda *a, **k: FakeProc())
+    def fake_run(args, **kwargs):
+        assert args == ["/usr/bin/intel_gpu_top", "-J", "-s", "1000",
+                        "-n", "1", "-o", "-"]
+        assert kwargs["timeout"] == 5.0
+        return FakeProc()
+
+    monkeypatch.setattr(gpu_mod.subprocess, "run", fake_run)
     c._intel_top_last = None
     res = c._intel_gpu_top()
     assert res["available"] is True
