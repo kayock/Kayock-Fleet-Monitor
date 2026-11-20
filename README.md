@@ -5,14 +5,6 @@ health, AI model servers and three-machine fleet monitoring**. Each machine
 runs the same Python application and shares one frontend; the fleet works
 from any machine and keeps working locally when the others are offline.
 
-## Live dashboard preview
-
-![Three connected machines monitored from the live Fleet Monitor dashboard](docs/screenshots/fleet-overview.png)
-
-The real-world dashboard has been recorded running across **Windows Dell, Ubuntu Portable, and Ubuntu Station**. The walkthrough shows live CPU, memory, GPU, storage and network telemetry, switching between a per-machine view and **All Machines**, LAN peer discovery, and the fleet-wide AI model server inventory. See the [full screenshot gallery](#screenshots) for readable captures of each view.
-
----
-
 No AI model, no external AI service, no cloud connection: the JavaScript
 chart library (Plotly) and the stylesheet are bundled locally, so the
 dashboard runs fully offline after setup.
