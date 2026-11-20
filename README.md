@@ -9,6 +9,12 @@ No AI model, no external AI service, no cloud connection: the JavaScript
 chart library (Plotly) and the stylesheet are bundled locally, so the
 dashboard runs fully offline after setup.
 
+## Video demo
+
+[![Watch Kayock Fleet Monitor running across three machines](https://img.youtube.com/vi/iJTCwsJtFHw/hqdefault.jpg)](https://youtu.be/iJTCwsJtFHw)
+
+[Watch the Kayock Fleet Monitor demo on YouTube](https://youtu.be/iJTCwsJtFHw) — a recording of the live dashboard and connected-machine monitoring.
+
 ---
 
 ## Supported platforms (reference deployment)
