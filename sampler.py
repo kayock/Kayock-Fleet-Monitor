@@ -594,26 +594,47 @@ class SystemSampler:
         except Exception as exc:
             return {"list": [], "total": None, "error": str(exc), "note": note,
                     "idle_excluded": 0}
+        skipped_inaccessible = 0
         for p in procs:
-            info = p.info
+            try:
+                info = p.info
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                skipped_inaccessible += 1
+                continue
+            except Exception:
+                skipped_inaccessible += 1
+                continue
             name = info.get("name") or "<unknown>"
             if is_idle_process_name(name):
                 idle_skipped += 1
                 continue
             mi = info.get("memory_info")
+            try:
+                cpu = info.get("cpu_percent")
+                mem = info.get("memory_percent")
+                rss = getattr(mi, "rss", None) if mi is not None else None
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                skipped_inaccessible += 1
+                continue
             rows.append({
                 "pid": info.get("pid"),
                 "name": name,
-                "cpu_percent": info.get("cpu_percent"),
-                "memory_percent": info.get("memory_percent"),
-                "rss": getattr(mi, "rss", None),
+                "cpu_percent": cpu,
+                "memory_percent": mem,
+                "rss": rss,
             })
-        total = len(rows) + idle_skipped
+        total = len(rows) + idle_skipped + skipped_inaccessible
         rows.sort(key=lambda r: ((r["cpu_percent"] is None,
                                   -(r["cpu_percent"] or 0.0)),
                                  -(r["memory_percent"] or 0.0)))
+        if skipped_inaccessible:
+            note += (f" {skipped_inaccessible} inaccessible process(es) "
+                     "skipped during sampling.")
         return {"list": rows[:self.top_processes], "total": total,
-                "error": None, "note": note, "idle_excluded": idle_skipped}
+                "error": None, "note": note, "idle_excluded": idle_skipped,
+                "inaccessible_skipped": skipped_inaccessible}
 
     # -- GPU section (non-blocking executor pattern) ----------------------------
     def _collect_gpu_section(self):
@@ -742,7 +763,7 @@ class SystemSampler:
                         "total_bytes_sent": None, "total_bytes_recv": None,
                         "available": False, "reason": "waiting for first sample"},
             "processes": {"list": [], "total": None, "error": None, "note": "",
-                          "idle_excluded": 0},
+                          "idle_excluded": 0, "inaccessible_skipped": 0},
             "gpu": gpu_placeholder(),
             "histories": {k: [] for k in _HISTORY_KEYS},
             "refresh_seconds": self.refresh_seconds,

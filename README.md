@@ -142,6 +142,8 @@ histories, calibration pass instead of startup spikes, PDH + Get-Counter
 fallback for the Intel UHD 770, offline assets, no authentication gates or
 artificial limits.
 
+Full install/update instructions: [docs/INSTALL.md](docs/INSTALL.md).
+
 ## How to run the tests
 
 ```
@@ -151,7 +153,7 @@ artificial limits.
 ./.venv/bin/python -m pytest tests -v
 ```
 
-**147 tests** (no hardware or AI servers required) covering: delta math and
+**150+ tests** (no hardware or AI servers required) covering: delta math and
 bounded history, the no-resampling guarantee, GPU compose-branch regression +
 Get-Counter fallback, **Linux collectors** (nvidia power parsing, Intel sysfs
 discovery, intel_gpu_top JSON parsing, explicit unavailable states), **AI
@@ -175,7 +177,10 @@ Kayock Fleet Monitor/
 ├── setup_windows.bat  start_monitor.bat        (Windows launchers, CRLF)
 ├── setup_linux.sh  start_linux.sh              (Ubuntu launchers, executable)
 ├── templates/index.html  static/css/style.css  static/js/app.js  static/js/plotly.min.js
-├── tests/                automated pytest suite (147 tests)
+├── tests/                automated pytest suite
+├── docs/INSTALL.md        portable install + update guide
+├── docs/INTEL_GPU.md      Intel util permission options
+├── docs/WINDOWS_UPDATE.md  Windows deploy notes / SSH blocker
 └── README.md             this file
 ```
 
@@ -225,7 +230,7 @@ Local runtime configuration files (`fleet.json`, `ai_servers.json`, `monitor_con
 
 ## Screenshots
 
-Real captures from the three-machine fleet and an independent community hardware test. Browser tabs are cropped out, and private LAN addresses are blurred in the fleet overview. The AI server inventory screenshot is deferred until its probe errors are fixed.
+Real captures from the three-machine fleet and an independent community hardware test. Browser tabs are cropped out, and private LAN addresses are blurred in the fleet overview. AI discovery hardening for Docker ports / missing PIDs landed in 3.1.0.
 
 ### Connected fleet — Windows, Station, and Portable
 

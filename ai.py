@@ -725,7 +725,43 @@ class AIManager:
                        type_hint=KNOWN_AI_PORTS[port], pid=owner,
                        port_listening=True, process_found=bool(owner))
 
-        return targets
+        return self._dedupe_portless_processes(targets)
+
+    @staticmethod
+    def _dedupe_portless_processes(targets):
+        """Attach Docker-orphaned AI processes to same-type listening ports.
+
+        When Ollama (or similar) runs as a host process but Docker publishes
+        the TCP port with pid=None, discovery previously emitted both
+        ``proc:<pid>`` (loading, no port) and ``127.0.0.1:11434`` (online).
+        Merge them into one listening/online target.
+        """
+        listening_by_type = {}
+        for t in targets:
+            if t.get("port") and t.get("type_hint"):
+                listening_by_type.setdefault(t["type_hint"], []).append(t)
+
+        merged = []
+        for t in targets:
+            if t.get("port"):
+                merged.append(t)
+                continue
+            hint = t.get("type_hint")
+            attached = False
+            for cand in listening_by_type.get(hint, []):
+                if cand.get("pid") not in (None, t.get("pid")):
+                    continue
+                if cand.get("pid") is None:
+                    cand["pid"] = t.get("pid")
+                    cand["process_found"] = True
+                    for field in ("name", "exe", "cmdline", "create_time"):
+                        if t.get(field) and not cand.get(field):
+                            cand[field] = t.get(field)
+                attached = True
+                break
+            if not attached:
+                merged.append(t)
+        return merged
 
     # -- probe one target ------------------------------------------------------
     def _probe_one(self, target):
