@@ -179,8 +179,26 @@ html, body {
 .kv td:first-child { color: var(--text-dim); width: 40%; }
 .kv td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
 
-.table-scroll { overflow-x: auto; }
-.tbl { width: 100%; border-collapse: collapse; font-size: .84rem; }
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+.tbl { width: 100%; border-collapse: collapse; font-size: .84rem; table-layout: auto; }
+.soft-details {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(34, 48, 82, .7);
+  border-radius: 10px;
+  background: rgba(16, 23, 43, .45);
+}
+.soft-details summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: .82rem;
+  user-select: none;
+}
+.soft-details[open] summary { margin-bottom: 6px; color: var(--text); }
 .tbl th {
   text-align: left;
   color: var(--text-dim);

@@ -345,6 +345,26 @@
     }
   }
 
+  function volumeRow(v, withKind) {
+    var label = esc(v.mountpoint || v.device);
+    if (v.error) {
+      return '<tr><td class="ellip">' + label + '</td>'
+        + (withKind ? '<td>' + esc(v.kind || "—") + '</td>' : "")
+        + '<td>' + esc(v.fstype) + '</td>'
+        + '<td colspan="' + (withKind ? 4 : 4) + '" class="unavailable">unavailable — '
+        + esc(v.error) + '</td></tr>';
+    }
+    var pct = v.percent === null || v.percent === undefined
+      ? "—" : Math.round(v.percent) + "%";
+    return '<tr><td class="ellip">' + label + '</td>'
+      + (withKind ? '<td>' + esc(v.kind || "—") + '</td>' : "")
+      + '<td>' + esc(v.fstype) + '</td>'
+      + '<td>' + fmtBytes(v.total) + '</td>'
+      + '<td>' + fmtBytes(v.used) + '</td>'
+      + '<td>' + fmtBytes(v.free) + '</td>'
+      + '<td>' + pct + '</td></tr>';
+  }
+
   function renderStorage(d) {
     var st = d.storage || {};
     var io = st.io || {};
@@ -362,61 +382,106 @@
       ? ("IOPS " + Math.round(io.read_iops || 0) + " r / " + Math.round(io.write_iops || 0) + " w")
       : ("I/O rates unavailable" + (io.reason ? " — " + io.reason : " (measuring…)")));
 
+    var allVols = st.volumes || [];
+    var primary = st.primary_volumes;
+    var other = st.other_volumes;
+    if (!primary) {
+      primary = allVols.filter(function (v) { return !v.kind || v.kind === "physical"; });
+      other = allVols.filter(function (v) { return v.kind && v.kind !== "physical"; });
+    }
     var tbody = document.getElementById("volumes-tbody");
     if (tbody) {
-      var vols = st.volumes || [];
-      if (!vols.length) {
+      if (!primary.length && !allVols.length) {
         tbody.innerHTML = '<tr><td colspan="6" class="note">No mounted volumes reported' +
           (st.volumes_error ? " — " + esc(st.volumes_error) : "") + '</td></tr>';
+      } else if (!primary.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="note">No physical volumes reported — see Snap / virtual mounts below</td></tr>';
       } else {
-        tbody.innerHTML = vols.map(function (v) {
-          if (v.error) {
-            return '<tr><td>' + esc(v.mountpoint || v.device) + '</td>'
-              + '<td>' + esc(v.fstype) + '</td>'
-              + '<td colspan="4" class="unavailable">unavailable — ' + esc(v.error) + '</td></tr>';
-          }
-          var pct = v.percent === null || v.percent === undefined
-            ? "—" : Math.round(v.percent) + "%";
-          return '<tr><td>' + esc(v.mountpoint || v.device) + '</td>'
-            + '<td>' + esc(v.fstype) + '</td>'
-            + '<td>' + fmtBytes(v.total) + '</td>'
-            + '<td>' + fmtBytes(v.used) + '</td>'
-            + '<td>' + fmtBytes(v.free) + '</td>'
-            + '<td>' + pct + '</td></tr>';
-        }).join("");
+        tbody.innerHTML = primary.map(function (v) { return volumeRow(v, false); }).join("");
       }
     }
-    setText("volumes-note", "Volumes are logical mounts; I/O below is measured on physical disks, so the names deliberately do not match.");
+    var otherDetails = document.getElementById("volumes-other-details");
+    var otherBody = document.getElementById("volumes-other-tbody");
+    var otherSummary = document.getElementById("volumes-other-summary");
+    if (otherDetails && otherBody) {
+      if (other && other.length) {
+        otherDetails.hidden = false;
+        if (otherSummary) {
+          otherSummary.textContent = "Show Snap / virtual mounts (" + other.length + ")";
+        }
+        otherBody.innerHTML = other.map(function (v) { return volumeRow(v, true); }).join("");
+      } else {
+        otherDetails.hidden = true;
+        otherBody.innerHTML = "";
+      }
+    }
+    setText("volumes-note", "Default view shows physical drives and user volumes. Snap/virtual mounts are expandable. I/O rates are measured on physical disks.");
     setText("disk-totals", io.total_read_bytes !== null && io.total_read_bytes !== undefined
       ? ("since boot: " + fmtBytes(io.total_read_bytes) + " read · " + fmtBytes(io.total_write_bytes) + " written")
       : "");
   }
 
+  function netRate(v) {
+    return v === null || v === undefined ? "measuring…" : fmtBytes(v) + "/s";
+  }
+
+  function netRow(a, withKind) {
+    var kind = a.kind || (a.is_loopback ? "loopback" : "physical");
+    var nm = esc(a.name);
+    if (!withKind && kind === "overlay") {
+      nm += ' <span class="mini">(overlay)</span>';
+    }
+    return '<tr><td class="ellip">' + nm + '</td>'
+      + (withKind ? '<td>' + esc(kind) + '</td>' : "")
+      + '<td>' + (kind === "loopback" ? "—" : netRate(a.recv_bps)) + '</td>'
+      + '<td>' + (kind === "loopback" ? "—" : netRate(a.sent_bps)) + '</td>'
+      + '<td>' + fmtBytes(a.bytes_recv) + '</td>'
+      + '<td>' + fmtBytes(a.bytes_sent) + '</td></tr>';
+  }
+
   function renderNetwork(d) {
     var n = d.network || {};
+    var totals = n.physical_totals || n.totals || {};
     var downEl = document.getElementById("net-down");
     var upEl = document.getElementById("net-up");
-    if (downEl) downEl.textContent = "↓ " + fmtRate(n.totals && n.totals.recv_bps);
-    if (upEl) upEl.textContent = "↑ " + fmtRate(n.totals && n.totals.sent_bps);
+    if (downEl) downEl.textContent = "↓ " + fmtRate(totals.recv_bps);
+    if (upEl) upEl.textContent = "↑ " + fmtRate(totals.sent_bps);
 
+    var ads = n.adapters || [];
+    var primary = ads.filter(function (a) {
+      var kind = a.kind || (a.is_loopback ? "loopback" : "physical");
+      return kind === "physical" || kind === "overlay";
+    });
+    var other = ads.filter(function (a) {
+      var kind = a.kind || (a.is_loopback ? "loopback" : "physical");
+      return kind === "virtual" || kind === "loopback";
+    });
     var tbody = document.getElementById("net-tbody");
     if (tbody) {
-      var ads = n.adapters || [];
-      if (!ads.length) {
+      if (!primary.length && !ads.length) {
         tbody.innerHTML = '<tr><td colspan="5" class="note">No network adapters reported</td></tr>';
+      } else if (!primary.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="note">No physical adapters reported — see virtual / loopback below</td></tr>';
       } else {
-        tbody.innerHTML = ads.map(function (a) {
-          var nm = esc(a.name) + (a.is_loopback ? ' <span class="mini">(loopback)</span>' : "");
-          function rate(v) { return v === null || v === undefined ? "measuring…" : fmtBytes(v) + "/s"; }
-          return '<tr><td class="ellip">' + nm + '</td>'
-            + '<td>' + (a.is_loopback ? "—" : rate(a.recv_bps)) + '</td>'
-            + '<td>' + (a.is_loopback ? "—" : rate(a.sent_bps)) + '</td>'
-            + '<td>' + fmtBytes(a.bytes_recv) + '</td>'
-            + '<td>' + fmtBytes(a.bytes_sent) + '</td></tr>';
-        }).join("");
+        tbody.innerHTML = primary.map(function (a) { return netRow(a, false); }).join("");
       }
     }
-    setText("net-note", "Rates are bytes/sec deltas between samples; totals are cumulative since boot — do not read totals as speed.");
+    var otherDetails = document.getElementById("net-other-details");
+    var otherBody = document.getElementById("net-other-tbody");
+    var otherSummary = document.getElementById("net-other-summary");
+    if (otherDetails && otherBody) {
+      if (other.length) {
+        otherDetails.hidden = false;
+        if (otherSummary) {
+          otherSummary.textContent = "Show virtual / loopback adapters (" + other.length + ")";
+        }
+        otherBody.innerHTML = other.map(function (a) { return netRow(a, true); }).join("");
+      } else {
+        otherDetails.hidden = true;
+        otherBody.innerHTML = "";
+      }
+    }
+    setText("net-note", "Headline rates prioritize physical LAN adapters. Docker bridges, veth, and loopback are listed separately. Totals are cumulative since boot — do not read totals as speed.");
   }
 
   function renderProcesses(d) {

@@ -139,3 +139,19 @@ def test_valid_elapsed():
     assert valid_elapsed(0) is None
     assert valid_elapsed(-1) is None
     assert valid_elapsed(2.0) == 2.0
+
+
+def test_classify_volume_and_adapter_and_idle():
+    from sampler import (classify_adapter, classify_volume,
+                         is_idle_process_name)
+    assert classify_volume("/dev/nvme0n1p2", "/", "ext4") == "physical"
+    assert classify_volume("/dev/loop0", "/snap/firefox/1", "squashfs") == "snap"
+    assert classify_volume("tmpfs", "/run", "tmpfs") == "virtual"
+    assert classify_adapter("eno1") == "physical"
+    assert classify_adapter("docker0") == "virtual"
+    assert classify_adapter("br-abc123") == "virtual"
+    assert classify_adapter("veth0a4d82e") == "virtual"
+    assert classify_adapter("lo") == "loopback"
+    assert classify_adapter("Tailscale") == "overlay"
+    assert is_idle_process_name("System Idle Process")
+    assert not is_idle_process_name("python.exe")
