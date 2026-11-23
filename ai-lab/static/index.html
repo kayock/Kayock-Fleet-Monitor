@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>FOXAI AI Lab Command Center</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261122c" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261123a" />
 </head>
 <body>
   <header class="top">
@@ -57,6 +57,15 @@
               <option value="disabled" selected>Disabled</option>
             </select>
           </label>
+          <label>Maximum Output Tokens
+            <select id="chat-max-mode">
+              <option value="default" selected>Use model/client default</option>
+              <option value="custom">Custom value</option>
+            </select>
+          </label>
+          <label id="chat-max-custom-wrap" hidden>Custom max tokens
+            <input id="chat-max-custom" type="number" min="1" step="1" placeholder="e.g. 512" />
+          </label>
           <div id="chat-meta" class="note"></div>
           <button type="button" id="chat-clear">Clear chat</button>
         </aside>
@@ -81,6 +90,15 @@
         <label>Model B <select id="cmp-b"></select></label>
         <label>Model C (optional) <select id="cmp-c"><option value="">—</option></select></label>
         <p id="cmp-same-note" class="note" aria-live="polite"></p>
+        <label>Maximum Output Tokens
+          <select id="cmp-max-mode">
+            <option value="default" selected>Use model/client default</option>
+            <option value="custom">Custom value</option>
+          </select>
+        </label>
+        <label id="cmp-max-custom-wrap" hidden>Custom max tokens
+          <input id="cmp-max-custom" type="number" min="1" step="1" placeholder="e.g. 256" />
+        </label>
         <label class="grow">Prompt
           <textarea id="cmp-prompt" rows="3" placeholder="Short comparison prompt…"></textarea>
         </label>
@@ -117,6 +135,6 @@
     <span id="foot-ts"></span>
   </footer>
   <script src="/qr/vendor/qrcode.js"></script>
-  <script src="/static/app.js?v=20261122c"></script>
+  <script src="/static/app.js?v=20261123a"></script>
 </body>
 </html>

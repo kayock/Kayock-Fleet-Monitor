@@ -517,12 +517,16 @@ def classify_stop_reason(*, ok: bool | None = None,
                          error: str | None = None,
                          timed_out: bool = False,
                          connection_error: bool = False,
+                         cancelled: bool = False,
                          completion_tokens: int | None = None,
                          max_output: int | None = None,
                          stream_complete: bool | None = None) -> dict:
     evidence = []
     code = "unknown"
-    if timed_out:
+    if cancelled:
+        code = "streaming_interrupted"
+        evidence.append("Client cancelled or disconnected before completion")
+    elif timed_out:
         code = "request_timed_out"
         evidence.append("Client or transport timeout flagged")
     elif connection_error:
@@ -792,6 +796,12 @@ class DiagnosticStore:
     def add(self, record: dict) -> dict:
         with _lock:
             rec = deepcopy(record)
+            # Exactly-once: reuse existing record when client request_id matches
+            rid = rec.get("request_id")
+            if rid:
+                for existing in self._records:
+                    if existing.get("request_id") == rid:
+                        return deepcopy(existing)
             rec.setdefault("id", uuid.uuid4().hex[:12])
             rec.setdefault("ts", time.time())
             # Privacy: never persist prompts/responses/secrets
@@ -809,6 +819,7 @@ class DiagnosticStore:
                 error=rec.get("error"),
                 timed_out=bool(rec.get("timed_out")),
                 connection_error=bool(rec.get("connection_error")),
+                cancelled=bool(rec.get("cancelled")),
                 completion_tokens=rec.get("completion_tokens"),
                 max_output=(rec.get("request") or {}).get("max_tokens")
                 or (rec.get("request") or {}).get("max_output"),

@@ -1,4 +1,10 @@
 (() => {
+  const PREF_CHAT_MODE = "ailab.max_tokens.chat.mode";
+  const PREF_CHAT_CUSTOM = "ailab.max_tokens.chat.custom";
+  const PREF_CMP_MODE = "ailab.max_tokens.compare.mode";
+  const PREF_CMP_CUSTOM = "ailab.max_tokens.compare.custom";
+  const FLEET_MONITOR = "http://10.0.0.202:5000";
+
   const state = {
     discovery: null,
     chatHistory: [],
@@ -12,6 +18,97 @@
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function loadPref(key, fallback) {
+    try {
+      const v = localStorage.getItem(key);
+      return v == null ? fallback : v;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function savePref(key, value) {
+    try { localStorage.setItem(key, String(value)); } catch { /* ignore */ }
+  }
+
+  function bindMaxTokenControls(modeId, customId, wrapId, modeKey, customKey) {
+    const modeEl = byId(modeId);
+    const customEl = byId(customId);
+    const wrap = byId(wrapId);
+    if (!modeEl || !customEl || !wrap) return;
+    modeEl.value = loadPref(modeKey, "default") === "custom" ? "custom" : "default";
+    customEl.value = loadPref(customKey, "") || "";
+    const sync = () => {
+      const custom = modeEl.value === "custom";
+      wrap.hidden = !custom;
+      savePref(modeKey, custom ? "custom" : "default");
+      if (custom && customEl.value) savePref(customKey, customEl.value);
+    };
+    modeEl.addEventListener("change", sync);
+    customEl.addEventListener("change", () => {
+      if (customEl.value) savePref(customKey, customEl.value);
+    });
+    sync();
+  }
+
+  /** @returns {{ ok: true, value: number|null, label: string } | { ok: false, error: string }} */
+  function readMaxTokens(modeId, customId) {
+    const mode = byId(modeId).value;
+    if (mode !== "custom") {
+      return { ok: true, value: null, label: "Model default" };
+    }
+    const raw = String(byId(customId).value || "").trim();
+    if (!raw) return { ok: false, error: "Enter a positive custom max-token value." };
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      return { ok: false, error: "Custom max tokens must be a positive integer." };
+    }
+    return { ok: true, value: n, label: String(n) };
+  }
+
+  function diagWarning(body) {
+    const stop = body.stop_reason || {};
+    const code = stop.code || "";
+    if (code === "output_limit_reached") return "⚠️ Output token limit reached";
+    if (code === "streaming_interrupted") return "⚠️ Response stream interrupted";
+    if (code === "request_timed_out") return "⚠️ Request timed out";
+    if (code === "connection_lost") return "⚠️ Connection lost";
+    if (code === "unknown" && body.error) return "Completion reason unavailable";
+    if (body.done_reason === "length" || body.finish_reason === "length") {
+      return "⚠️ Output token limit reached";
+    }
+    return "";
+  }
+
+  function diagSummaryHtml(body, modelLabel, outputLimitLabel) {
+    const stop = body.stop_reason || {};
+    const stopLabel = stop.label
+      || body.done_reason
+      || body.finish_reason
+      || (body.ok ? "Completion reason unavailable" : (body.error || "error"));
+    const gen = body.completion_tokens != null ? String(body.completion_tokens) : "Unknown — backend did not report";
+    const speed = body.tokens_per_sec != null ? `${body.tokens_per_sec} tok/s` : "—";
+    const dur = body.elapsed_ms != null ? `${body.elapsed_ms} ms` : "—";
+    const warn = diagWarning(body);
+    const link = body.diagnostic_id
+      ? `<a href="${esc(body.diagnostic_url || (FLEET_MONITOR + "/#mcc?diag=" + body.diagnostic_id))}" target="_blank" rel="noreferrer">Open diagnostics ${esc(body.diagnostic_id)}</a>`
+      : "";
+    const reqMode = (body.request && body.request.max_tokens_mode) || null;
+    const limitShown = outputLimitLabel
+      || (reqMode === "model_default" || body.request?.max_tokens == null
+        ? "Model default"
+        : String(body.request.max_tokens));
+    return `<div class="diag-summary">
+      <div><b>Model:</b> ${esc(modelLabel || body.model || "—")}</div>
+      <div><b>Output limit:</b> ${esc(limitShown)}</div>
+      <div><b>Generated:</b> ${esc(gen)} <span title="Backend-reported completion tokens; not character length">(backend tokens)</span></div>
+      <div><b>Stop reason:</b> ${esc(stopLabel)}${stop.confidence ? ` (${esc(stop.confidence)})` : ""}</div>
+      <div><b>Speed:</b> ${esc(speed)} · <b>Duration:</b> ${esc(dur)}</div>
+      ${warn ? `<div class="diag-warn">${esc(warn)}</div>` : ""}
+      ${link ? `<div>${link}</div>` : ""}
+    </div>`;
   }
 
   function fmtBytes(n) {
@@ -204,10 +301,12 @@
       const thinking = m.thinking
         ? `<div class="thinking"><div class="role">Thinking</div>${esc(m.thinking)}</div>`
         : "";
+      const diag = m.diagHtml || "";
       return `<div class="msg ${esc(m.role)}">
         <div class="role">${esc(m.role)}</div>
         ${thinking}
         <div class="answer">${esc(m.content || "")}</div>
+        ${diag}
       </div>`;
     }).join("") || `<div class="note">No messages yet.</div>`;
     log.scrollTop = log.scrollHeight;
@@ -236,30 +335,41 @@
         `Model ${model} is installed but not loaded. Load it manually first; AI Lab will not auto-load.`;
       return;
     }
+    const mt = readMaxTokens("chat-max-mode", "chat-max-custom");
+    if (!mt.ok) {
+      byId("chat-stats").textContent = mt.error;
+      return;
+    }
     state.chatHistory.push({ role: "user", content: text });
     byId("chat-input").value = "";
     renderChat();
     byId("chat-stats").textContent = "Waiting for response…";
     const started = performance.now();
+    const payload = {
+      endpoint: s.endpoint,
+      engine: s.engine,
+      model,
+      messages: state.chatHistory.map(({ role, content }) => ({ role, content })),
+      think: byId("chat-think").value,
+      require_loaded: true,
+      stream: false,
+    };
+    // Omit max_tokens entirely for model default — do not send a silent cap.
+    if (mt.value != null) payload.max_tokens = mt.value;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          endpoint: s.endpoint,
-          engine: s.engine,
-          model,
-          messages: state.chatHistory.map(({ role, content }) => ({ role, content })),
-          think: byId("chat-think").value,
-          max_tokens: 96,
-          require_loaded: true,
-          stream: false,
-        }),
+        body: JSON.stringify(payload),
       });
       const body = await res.json();
       const elapsed = Math.round(performance.now() - started);
       if (!body.ok) {
-        state.chatHistory.push({ role: "assistant", content: `Error: ${body.error || "request failed"}` });
+        state.chatHistory.push({
+          role: "assistant",
+          content: `Error: ${body.error || "request failed"}`,
+          diagHtml: diagSummaryHtml(body, model, mt.label),
+        });
         byId("chat-stats").textContent = `Failed in ${elapsed} ms`;
       } else {
         state.chatHistory.push({
@@ -267,21 +377,21 @@
           content: body.content || "",
           thinking: body.thinking || "",
           diagnostic_id: body.diagnostic_id || null,
+          diagHtml: diagSummaryHtml(body, model, mt.label),
         });
         const stop = body.stop_reason || {};
         const stopBit = stop.label
           ? ` · ${stop.label}${stop.confidence ? ` (${stop.confidence})` : ""}`
           : (body.done_reason || body.finish_reason
             ? ` · stop=${body.done_reason || body.finish_reason}` : "");
-        const maxTok = (body.request && body.request.max_tokens) || 96;
         byId("chat-stats").innerHTML =
           `${elapsed} ms · ${body.completion_tokens != null ? body.completion_tokens + " tokens" : "tokens n/a"}` +
           (body.tokens_per_sec != null ? ` · ${body.tokens_per_sec} tok/s` : "") +
-          ` · max_tokens=${maxTok}` +
+          ` · output=${esc(mt.label)}` +
           stopBit +
           ` · ${s.engine} · ${model}` +
           (body.diagnostic_id
-            ? ` · <a href="${esc(body.diagnostic_url || ("http://10.0.0.202:5000/#mcc?diag=" + body.diagnostic_id))}" target="_blank" rel="noreferrer">Diagnostics ${esc(body.diagnostic_id)}</a>`
+            ? ` · <a href="${esc(body.diagnostic_url || (FLEET_MONITOR + "/#mcc?diag=" + body.diagnostic_id))}" target="_blank" rel="noreferrer">Diagnostics ${esc(body.diagnostic_id)}</a>`
             : "");
       }
       renderChat();
@@ -447,7 +557,7 @@
     byId(id).addEventListener("change", updateSameModelWarning);
   });
 
-  function renderCompareSlot(slotEl, result, pending) {
+  function renderCompareSlot(slotEl, result, pending, outputLimitLabel) {
     const t = (result && result.target) || {};
     const title = t.label || `${t.model || "?"} · ${t.engine || "?"} @ ${hostPort(t.endpoint || "")}`;
     if (pending) {
@@ -460,14 +570,16 @@
       slotEl.innerHTML = `<h3>${esc(title)}</h3>
         <div class="badge error">error</div>
         <pre class="answer">${esc((result && result.error) || "failed")}</pre>
-        <div class="note">${esc((result && result.elapsed_ms) || "—")} ms · ${esc(t.endpoint || "")}</div>`;
+        <div class="note">${esc((result && result.elapsed_ms) || "—")} ms · ${esc(t.endpoint || "")}</div>
+        ${diagSummaryHtml(result || {}, t.model, outputLimitLabel)}`;
       return;
     }
     slotEl.innerHTML = `<h3>${esc(title)}</h3>
       <div class="badge online">ok</div>
       ${result.thinking ? `<div class="thinking">${esc(result.thinking)}</div>` : ""}
       <pre class="answer">${esc(result.content || "")}</pre>
-      <div class="note">${esc(result.elapsed_ms)} ms · tokens ${esc(result.completion_tokens ?? "—")} · ${esc(result.tokens_per_sec ?? "—")} tok/s · ${esc(t.model)} @ ${esc(hostPort(t.endpoint || ""))}</div>`;
+      <div class="note">${esc(result.elapsed_ms)} ms · tokens ${esc(result.completion_tokens ?? "—")} · ${esc(result.tokens_per_sec ?? "—")} tok/s · ${esc(t.model)} @ ${esc(hostPort(t.endpoint || ""))}</div>
+      ${diagSummaryHtml(result, t.model, outputLimitLabel)}`;
   }
 
   byId("cmp-run").addEventListener("click", async () => {
@@ -475,6 +587,11 @@
     const raw = [byId("cmp-a").value, byId("cmp-b").value, byId("cmp-c").value].filter(Boolean);
     if (!prompt || raw.length < 2) {
       byId("cmp-results").innerHTML = `<div class="card note">Provide a prompt and at least two models.</div>`;
+      return;
+    }
+    const mt = readMaxTokens("cmp-max-mode", "cmp-max-custom");
+    if (!mt.ok) {
+      byId("cmp-results").innerHTML = `<div class="card note">${esc(mt.error)}</div>`;
       return;
     }
     const targets = raw.map((v) => JSON.parse(v));
@@ -493,7 +610,7 @@
       const el = document.createElement("article");
       el.className = "card";
       el.dataset.slot = String(i);
-      renderCompareSlot(el, { target: t }, true);
+      renderCompareSlot(el, { target: t }, true, mt.label);
       byId("cmp-results").appendChild(el);
       return el;
     });
@@ -501,29 +618,30 @@
     // Independent requests so a slow/failed model never blocks others from rendering.
     await Promise.all(targets.map(async (t, i) => {
       try {
+        const payload = {
+          endpoint: t.endpoint,
+          engine: t.engine,
+          model: t.model,
+          messages: [{ role: "user", content: prompt }],
+          think: "disabled",
+          require_loaded: true,
+          stream: false,
+        };
+        if (mt.value != null) payload.max_tokens = mt.value;
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            endpoint: t.endpoint,
-            engine: t.engine,
-            model: t.model,
-            messages: [{ role: "user", content: prompt }],
-            think: "disabled",
-            max_tokens: 64,
-            require_loaded: true,
-            stream: false,
-          }),
+          body: JSON.stringify(payload),
         });
         const body = await res.json();
         body.target = t;
-        renderCompareSlot(slots[i], body, false);
+        renderCompareSlot(slots[i], body, false, mt.label);
       } catch (err) {
         renderCompareSlot(slots[i], {
           ok: false,
           error: String(err.message || err),
           target: t,
-        }, false);
+        }, false, mt.label);
       }
     }));
   });
@@ -574,6 +692,11 @@
   byId("refresh-all").addEventListener("click", () => {
     refreshDiscovery().then(loadQrLinks);
   });
+
+  bindMaxTokenControls("chat-max-mode", "chat-max-custom", "chat-max-custom-wrap",
+    PREF_CHAT_MODE, PREF_CHAT_CUSTOM);
+  bindMaxTokenControls("cmp-max-mode", "cmp-max-custom", "cmp-max-custom-wrap",
+    PREF_CMP_MODE, PREF_CMP_CUSTOM);
 
   refreshDiscovery().then(loadQrLinks);
   renderChat();

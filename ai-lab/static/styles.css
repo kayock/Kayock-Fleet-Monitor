@@ -132,6 +132,24 @@ select, textarea, input {
   font-size: .85rem;
 }
 .answer { white-space: pre-wrap; }
+.diag-summary {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, .65);
+  font-size: .78rem;
+  color: var(--dim);
+  display: grid;
+  gap: 3px;
+}
+.diag-summary b { color: var(--text); font-weight: 600; }
+.diag-warn {
+  margin-top: 4px;
+  color: #fbbf24;
+  font-weight: 600;
+}
+.diag-summary a { color: var(--accent, #7dd3fc); }
 .chat-form { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
 .compare-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
 .compare-controls .grow { grid-column: 1 / -1; }

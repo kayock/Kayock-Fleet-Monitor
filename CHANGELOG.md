@@ -17,6 +17,8 @@ configurations or restart services.
   timing, bounded local history (`diagnostic_history.json`)
 - **FOXAI AI Lab bridge** — chat/compare posts metadata-only records to
   `/api/diagnostics/ingest`; UI shows stop reason + Diagnostics link
+- **Streaming diagnostics** — Ollama NDJSON and OpenAI SSE emit exactly one
+  final record (including interrupted / cancelled / timed-out streams)
 - **Rules-based troubleshooting** — deterministic findings (output limit,
   context, timeout, connection, model unavailable, slow generation)
 - **Configuration conflict detection** — distinguishes intentional overrides vs
@@ -24,6 +26,14 @@ configurations or restart services.
 - **Performance history** — completed/failed counts, avg tok/s, timeouts,
   output-limit occurrences (from captured requests only)
 - **Diagnostic reports** — Copy text / Export JSON with privacy sanitization
+
+### Fixed (AI Lab)
+
+- Removed hard-coded Direct Chat `max_tokens: 96` and Compare `max_tokens: 64`
+- Direct Chat / Compare: **Maximum Output Tokens** = model default or custom
+- Model-default mode omits Ollama `num_predict` and OpenAI `max_tokens`
+- Compact per-response diagnostic summary with Fleet Monitor deep link
+- `request_id` de-duplication on diagnostics ingest
 
 ### Safety / non-goals
 

@@ -19,7 +19,14 @@ import discovery
 ROOT = Path(__file__).resolve().parent
 QR_SRC = Path("/home/kayock/Projects/Kayock-QR-Generator/src")
 APP_NAME = "FOXAI AI Lab Command Center"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
+
+
+def _parse_max_tokens(body: dict):
+    """None = model/client default. Reject invalid custom values."""
+    if "max_tokens" not in body:
+        return None, None
+    return chat_proxy.normalize_max_tokens(body.get("max_tokens"))
 
 app = Flask(__name__, static_folder=str(ROOT / "static"),
             template_folder=str(ROOT / "templates"))
@@ -64,10 +71,11 @@ def api_chat():
     messages = body.get("messages") or []
     if not endpoint or not model or not messages:
         return jsonify({"ok": False, "error": "endpoint, model, messages required"}), 400
+    max_tokens, mt_err = _parse_max_tokens(body)
+    if mt_err:
+        return jsonify({"ok": False, "error": mt_err}), 400
     # Streaming?
     if body.get("stream"):
-        engine_l = engine.lower()
-
         def generate():
             try:
                 info = chat_proxy.list_loaded_models(endpoint, engine)
@@ -88,7 +96,7 @@ def api_chat():
                     for chunk in chat_proxy.stream_ollama_chat(
                             endpoint=endpoint, model=model, messages=messages,
                             think=body.get("think", "auto"),
-                            max_tokens=int(body.get("max_tokens") or 256)):
+                            max_tokens=max_tokens):
                         yield chunk
                 else:
                     if info.get("ok") is False:
@@ -99,7 +107,7 @@ def api_chat():
                         return
                     for chunk in chat_proxy.stream_openai_chat(
                             endpoint=endpoint, model=model, messages=messages,
-                            max_tokens=int(body.get("max_tokens") or 256)):
+                            max_tokens=max_tokens):
                         yield chunk
             except Exception as exc:
                 yield (json.dumps({"ok": False,
@@ -111,7 +119,7 @@ def api_chat():
     result = chat_proxy.chat_completion(
         endpoint=endpoint, engine=engine, model=model, messages=messages,
         think=body.get("think", "auto"),
-        max_tokens=int(body.get("max_tokens") or 128),
+        max_tokens=max_tokens,
         require_loaded=bool(body.get("require_loaded", True)),
     )
     return jsonify(result), (200 if result.get("ok") else 400)
@@ -134,7 +142,9 @@ def api_compare():
         return jsonify({"ok": False, "error": "select at most 3 models"}), 400
 
     think = body.get("think", "auto")
-    max_tokens = int(body.get("max_tokens") or 96)
+    max_tokens, mt_err = _parse_max_tokens(body)
+    if mt_err:
+        return jsonify({"ok": False, "error": mt_err}), 400
 
     def run_one(index: int, t: dict) -> tuple[int, dict]:
         endpoint = (t.get("endpoint") or "").strip()
