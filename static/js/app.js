@@ -1992,16 +1992,40 @@
     var html = "";
 
     if (tab === "overview") {
+      var statusDisp = (fields.model_status && fields.model_status.display)
+        || ov.model_status_display
+        || ov.model_status
+        || "—";
+      var failBox = "";
+      if (d.retrieval_ok === false || (insp.resolution && insp.resolution.error)) {
+        failBox = '<div class="diag-finding error">'
+          + '<b>Diagnostic retrieval failed</b>'
+          + '<div>Model: ' + esc(ov.model || "—") + '</div>'
+          + '<div>Machine: ' + esc(ov.machine || "—") + '</div>'
+          + '<div>Operation: live configuration inspect</div>'
+          + '<div class="mini">' + esc((insp.resolution && insp.resolution.error)
+            || ((insp.backend && insp.backend.errors) || []).join("; ")
+            || "Backend unreachable or unparsable") + '</div>'
+          + '<button type="button" class="btn" id="diag-retry-btn">Retry Diagnostics</button>'
+          + '</div>';
+      }
+      html += failBox;
       html += '<div class="diag-section"><h4>Overview</h4><div class="mcc-kv">'
         + '<div><span>Model</span><b class="ellip">' + esc(ov.model || "—") + '</b></div>'
         + '<div><span>Friendly name</span><b>' + esc(ov.friendly_name || "—") + '</b></div>'
         + '<div><span>Machine</span><b>' + esc(ov.machine || "—") + '</b></div>'
         + '<div><span>Engine</span><b>' + esc(ov.engine || "—") + '</b></div>'
         + '<div><span>Endpoint</span><b class="ellip">' + esc(ov.endpoint || "—") + '</b></div>'
-        + '<div><span>Status</span><b>' + esc(
-          (fields.model_status && fields.model_status.display) || ov.model_status || "—") + '</b></div>'
+        + (ov.configured_endpoint && ov.configured_endpoint !== ov.endpoint
+          ? '<div><span>Configured endpoint</span><b class="ellip">' + esc(ov.configured_endpoint) + '</b></div>' : "")
+        + '<div><span>Status</span><b>' + esc(statusDisp) + '</b></div>'
         + '</div>'
-        + '<p class="note">Read-only inspection. Values are never invented; unknown means the backend did not report the setting.</p></div>';
+        + (ov.endpoint_note ? '<div class="mini">' + esc(ov.endpoint_note) + '</div>' : "")
+        + (ov.model_status_source ? '<div class="mini">Status source: ' + esc(ov.model_status_source) + '</div>' : "")
+        + '<p class="note">Read-only inspection. Values are never invented; unknown means the backend did not report the setting. Failed retrieval is not the same as unloaded.</p></div>';
+      if ((insp.backend || {}).notes && insp.backend.notes.length) {
+        html += '<div class="mini">' + esc(insp.backend.notes.join(" ")) + '</div>';
+      }
       var perf = d.performance || {};
       html += '<div class="diag-section"><h4>Performance history</h4><div class="mcc-kv">'
         + '<div><span>Completed</span><b>' + esc(perf.requests_completed != null ? perf.requests_completed : "—") + '</b></div>'
@@ -2104,6 +2128,43 @@
     body.innerHTML = html;
   }
 
+  function fetchDiagnostics(card) {
+    var body = document.getElementById("diag-modal-body");
+    if (body) body.innerHTML = '<div class="note">Loading read-only configuration…</div>';
+    return postJSON("/api/diagnostics/inspect", {
+      card_id: card.id,
+      model: card.model,
+      machine: card.machine,
+      endpoint: card.endpoint,
+      engine: card.engine,
+    }).then(function (r) {
+      state.diag.data = (r.body && r.body.data) || null;
+      if (r.body && r.body.ok === false && state.diag.data) {
+        state.diag.data.retrieval_ok = false;
+        state.diag.data.api_message = r.body.message || "";
+      }
+      renderDiagBody();
+      var retry = document.getElementById("diag-retry-btn");
+      if (retry) retry.addEventListener("click", function () {
+        fetchDiagnostics(state.diag.card || card);
+      });
+    }).catch(function (err) {
+      var cardInfo = state.diag.card || card || {};
+      if (body) body.innerHTML = '<div class="diag-finding error">'
+        + '<b>Diagnostic retrieval failed</b>'
+        + '<div>Model: ' + esc(cardInfo.model || "—") + '</div>'
+        + '<div>Machine: ' + esc(cardInfo.machine || "—") + '</div>'
+        + '<div>Operation: POST /api/diagnostics/inspect</div>'
+        + '<div class="mini">' + esc(err && err.message ? err.message : String(err)) + '</div>'
+        + '<button type="button" class="btn" id="diag-retry-btn">Retry Diagnostics</button>'
+        + '</div>';
+      var retry = document.getElementById("diag-retry-btn");
+      if (retry) retry.addEventListener("click", function () {
+        fetchDiagnostics(state.diag.card || card);
+      });
+    });
+  }
+
   function openDiagnostics(card) {
     state.diag.card = card;
     state.diag.tab = "overview";
@@ -2115,22 +2176,8 @@
     document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-diag-tab") === "overview");
     });
-    var body = document.getElementById("diag-modal-body");
-    if (body) body.innerHTML = '<div class="note">Loading read-only configuration…</div>';
     openModal("diag-modal");
-    postJSON("/api/diagnostics/inspect", {
-      card_id: card.id,
-      model: card.model,
-      machine: card.machine,
-      endpoint: card.endpoint,
-      engine: card.engine,
-    }).then(function (r) {
-      state.diag.data = (r.body && r.body.data) || null;
-      renderDiagBody();
-    }).catch(function (err) {
-      if (body) body.innerHTML = '<div class="note">Diagnostics error: '
-        + esc(err && err.message ? err.message : String(err)) + '</div>';
-    });
+    fetchDiagnostics(card);
   }
 
   function diagFetchReport(asText) {

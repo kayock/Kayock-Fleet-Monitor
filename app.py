@@ -32,7 +32,7 @@ from flask import Flask, jsonify, render_template, request
 from ai import AIManager
 from diagnostics import (DiagnosticStore, build_diagnostic_report,
                          detect_config_conflicts, format_report_text,
-                         inspect_model_configuration)
+                         inspect_model_configuration, machines_match)
 from fleet import FleetManager
 from mcc import (ProfileStore, attach_profiles_to_cards, build_model_cards,
                  build_server_inventory, capabilities_for,
@@ -877,13 +877,72 @@ def create_app(sampler: SystemSampler | None = None,
         for c in cards:
             if model and c.get("model") != model:
                 continue
-            if machine and c.get("machine") != machine:
+            if machine and not machines_match(c.get("machine"), machine):
                 continue
             if endpoint and (c.get("endpoint") or "").rstrip("/") != endpoint.rstrip("/"):
                 continue
             if model or machine or endpoint:
                 return c, cards
         return None, cards
+
+    def _peer_host_for_card(card: dict | None) -> str | None:
+        """Registered fleet peer host for remote cards (never invent addresses)."""
+        if not card or card.get("is_self"):
+            return None
+        mid = card.get("machine_id")
+        if not mid:
+            return None
+        for m in fleet_manager.list_machines():
+            if m.get("id") == mid and m.get("host"):
+                return m.get("host")
+        return None
+
+    def _run_diagnostics_inspect(*, card_id=None, model=None, machine=None,
+                                 endpoint=None, engine=None):
+        card, _ = _find_mcc_card(card_id, model, machine, endpoint)
+        profile = {}
+        if card and card.get("profile_id"):
+            profile = profile_store.get(card["profile_id"]) or {}
+        peer_host = _peer_host_for_card(card)
+        card_payload = card or {
+            "machine": machine, "engine": engine, "endpoint": endpoint,
+            "model": model, "is_self": True,
+        }
+        inspection = inspect_model_configuration(
+            engine=engine or (card or {}).get("engine"),
+            endpoint=endpoint or (card or {}).get("endpoint"),
+            model=model or (card or {}).get("model"),
+            configured_args=(card or {}).get("configured_args"),
+            profile=profile,
+            card=card_payload,
+            peer_host=peer_host,
+        )
+        recent = diag_store.list(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+            limit=20,
+        )
+        # If machine soft-match returned nothing, still show model history
+        if not recent and inspection["overview"].get("model"):
+            recent = diag_store.list(
+                model=inspection["overview"].get("model"), limit=20)
+        perf = diag_store.performance_summary(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+        )
+        conflicts = detect_config_conflicts(inspection=inspection)
+        fields = ((inspection.get("backend") or {}).get("fields") or {})
+        has_data = any(isinstance(v, dict) and v.get("known") for v in fields.values())
+        resolution = inspection.get("resolution") or {}
+        return {
+            "inspection": inspection,
+            "recent_requests": recent,
+            "performance": perf,
+            "conflicts": conflicts,
+            "read_only": True,
+            "retrieval_ok": bool(has_data) and not resolution.get("error"),
+            "peer_host": peer_host,
+        }
 
     @app.route("/api/diagnostics/inspect", methods=["GET", "POST"])
     def diagnostics_inspect():
@@ -894,41 +953,18 @@ def create_app(sampler: SystemSampler | None = None,
         machine = body.get("machine") or request.args.get("machine")
         endpoint = body.get("endpoint") or request.args.get("endpoint")
         engine = body.get("engine") or request.args.get("engine")
-        card, _ = _find_mcc_card(card_id, model, machine, endpoint)
-        profile = {}
-        if card and card.get("profile_id"):
-            profile = profile_store.get(card["profile_id"]) or {}
-        inspection = inspect_model_configuration(
-            engine=engine or (card or {}).get("engine"),
-            endpoint=endpoint or (card or {}).get("endpoint"),
-            model=model or (card or {}).get("model"),
-            configured_args=(card or {}).get("configured_args"),
-            profile=profile,
-            card=card or {
-                "machine": machine, "engine": engine, "endpoint": endpoint,
-                "model": model,
-            },
-        )
-        recent = diag_store.list(
-            model=inspection["overview"].get("model"),
-            machine=inspection["overview"].get("machine"),
-            limit=20,
-        )
-        perf = diag_store.performance_summary(
-            model=inspection["overview"].get("model"),
-            machine=inspection["overview"].get("machine"),
-        )
-        conflicts = detect_config_conflicts(inspection=inspection)
-        return jsonify({
-            "ok": True,
-            "data": {
-                "inspection": inspection,
-                "recent_requests": recent,
-                "performance": perf,
-                "conflicts": conflicts,
-                "read_only": True,
-            },
-        })
+        data = _run_diagnostics_inspect(
+            card_id=card_id, model=model, machine=machine,
+            endpoint=endpoint, engine=engine)
+        resolution = (data.get("inspection") or {}).get("resolution") or {}
+        # Resolution failure with no backend data → explicit error (not fake unloaded)
+        if resolution.get("error") and not data.get("retrieval_ok"):
+            return jsonify({
+                "ok": False,
+                "message": resolution["error"],
+                "data": data,
+            }), 502
+        return jsonify({"ok": True, "data": data})
 
     @app.route("/api/diagnostics/history", methods=["GET"])
     def diagnostics_history():
@@ -969,34 +1005,18 @@ def create_app(sampler: SystemSampler | None = None,
     @app.route("/api/diagnostics/report", methods=["POST"])
     def diagnostics_report():
         body = request.get_json(silent=True) or {}
-        card_id = body.get("card_id")
-        model = body.get("model")
-        machine = body.get("machine")
-        endpoint = body.get("endpoint")
-        engine = body.get("engine")
-        card, _ = _find_mcc_card(card_id, model, machine, endpoint)
-        profile = {}
-        if card and card.get("profile_id"):
-            profile = profile_store.get(card["profile_id"]) or {}
-        inspection = inspect_model_configuration(
-            engine=engine or (card or {}).get("engine"),
-            endpoint=endpoint or (card or {}).get("endpoint"),
-            model=model or (card or {}).get("model"),
-            configured_args=(card or {}).get("configured_args"),
-            profile=profile,
-            card=card or {},
+        data = _run_diagnostics_inspect(
+            card_id=body.get("card_id"),
+            model=body.get("model"),
+            machine=body.get("machine"),
+            endpoint=body.get("endpoint"),
+            engine=body.get("engine"),
         )
-        recent = diag_store.list(
-            model=inspection["overview"].get("model"),
-            machine=inspection["overview"].get("machine"),
-            limit=20,
-        )
-        perf = diag_store.performance_summary(
-            model=inspection["overview"].get("model"),
-            machine=inspection["overview"].get("machine"),
-        )
+        inspection = data["inspection"]
         report = build_diagnostic_report(
-            inspection=inspection, recent=recent, performance=perf,
+            inspection=inspection,
+            recent=data.get("recent_requests") or [],
+            performance=data.get("performance"),
             include_raw=bool(body.get("include_raw")),
         )
         if body.get("format") == "text":

@@ -17,10 +17,13 @@ import urllib.error
 import urllib.request
 from copy import deepcopy
 from typing import Any
+from urllib.parse import urlparse
 
 UNKNOWN = "Unknown — backend does not report this setting."
+STATUS_UNKNOWN = "Status Unknown — retrieval failed"
 HISTORY_MAX = 200
 HISTORY_FILENAME = "diagnostic_history.json"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 _lock = threading.RLock()
 
@@ -94,6 +97,115 @@ def _engine_family(engine: str | None) -> str:
     if "lm-studio" in e or "lmstudio" in e:
         return "lm-studio"
     return "openai"
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    return (host or "").strip().lower() in LOOPBACK_HOSTS
+
+
+def _port_from_card(card: dict, parsed_port: int | None) -> int | None:
+    if parsed_port:
+        return int(parsed_port)
+    identity = card.get("identity") or {}
+    if identity.get("port"):
+        try:
+            return int(identity["port"])
+        except (TypeError, ValueError):
+            pass
+    if card.get("port"):
+        try:
+            return int(card["port"])
+        except (TypeError, ValueError):
+            pass
+    sk = card.get("server_key") or ""
+    if ":" in sk:
+        try:
+            return int(sk.rsplit(":", 1)[-1])
+        except ValueError:
+            pass
+    return None
+
+
+def resolve_inspect_endpoint(
+        endpoint: str | None, *, card: dict | None = None,
+        peer_host: str | None = None) -> dict:
+    """Resolve the backend URL for diagnostics from this Fleet Monitor host.
+
+    Peer inventory often stores the peer's own loopback (127.0.0.1). Contacting
+    that address from Station would hit Station's local engine — never do that.
+    When the card is remote and the endpoint is loopback, rewrite using the
+    registered fleet peer host (from fleet.json / machine config), keeping the
+    original port. This is not a guessed address; it is the configured peer.
+    """
+    card = card or {}
+    raw = (endpoint or card.get("endpoint") or "").strip().rstrip("/")
+    out = {
+        "endpoint": raw or None,
+        "configured_endpoint": raw or None,
+        "resolved": False,
+        "peer_host": peer_host,
+        "error": None,
+        "note": None,
+    }
+    if not raw:
+        out["error"] = "No endpoint available for live inspection"
+        return out
+    try:
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    except Exception as exc:
+        out["error"] = f"Invalid endpoint: {exc}"
+        out["endpoint"] = None
+        return out
+    host = parsed.hostname or ""
+    is_self = bool(card.get("is_self", True))
+    if is_self or not _is_loopback_host(host):
+        # Absolute LAN/remote URL, or local card — use as-is.
+        out["endpoint"] = raw
+        return out
+    # Remote card with loopback endpoint — must use registered peer host.
+    if not peer_host:
+        out["endpoint"] = None
+        out["error"] = (
+            f"Remote machine {card.get('machine')!r} reports loopback endpoint "
+            f"{raw!r}, but no registered fleet peer host is available to resolve it."
+        )
+        return out
+    if _is_loopback_host(peer_host):
+        out["endpoint"] = None
+        out["error"] = (
+            f"Registered peer host for {card.get('machine')!r} is also loopback "
+            f"({peer_host!r}); cannot reach the remote backend from this host."
+        )
+        return out
+    port = _port_from_card(card, parsed.port)
+    if not port:
+        out["endpoint"] = None
+        out["error"] = (
+            f"Cannot determine backend port for remote loopback endpoint {raw!r}."
+        )
+        return out
+    scheme = parsed.scheme or "http"
+    resolved = f"{scheme}://{peer_host}:{port}"
+    out["endpoint"] = resolved
+    out["resolved"] = True
+    out["note"] = (
+        f"Resolved peer loopback {raw} → {resolved} using registered fleet "
+        f"host for machine {card.get('machine')!r}."
+    )
+    return out
+
+
+def machines_match(a: str | None, b: str | None) -> bool:
+    """Soft match machine labels (Portable vs Ubuntu Portable, etc.)."""
+    if not a or not b:
+        return not a and not b
+    if a == b:
+        return True
+    na = re.sub(r"[^a-z0-9]+", "", a.lower())
+    nb = re.sub(r"[^a-z0-9]+", "", b.lower())
+    if na == nb:
+        return True
+    return na in nb or nb in na
 
 
 def parse_startup_args_lite(args: str | None) -> dict[str, Any]:
@@ -246,6 +358,12 @@ def inspect_ollama_model(endpoint: str, model: str) -> dict:
                 "unloaded", source="Ollama /api/ps", layer="reported_effective")
     else:
         result["errors"].append(f"/api/ps: {err or st}")
+        # Failed status retrieval must never silently become "unloaded".
+        result["fields"]["model_status"] = _field(
+            None, source="Ollama /api/ps (retrieval failed)",
+            layer="reported_effective")
+        result["fields"]["model_status"]["display"] = STATUS_UNKNOWN
+        result["fields"]["model_status"]["known"] = False
 
     st, body, err = _fetch_json(f"{base}/api/version", timeout=3.0)
     if st == 200 and isinstance(body, dict):
@@ -415,29 +533,44 @@ def inspect_model_configuration(*, engine: str | None, endpoint: str | None,
                                 model: str | None,
                                 configured_args: str | None = None,
                                 profile: dict | None = None,
-                                card: dict | None = None) -> dict:
+                                card: dict | None = None,
+                                peer_host: str | None = None) -> dict:
     """Unified read-only inspector. Never loads models."""
     card = card or {}
     profile = profile or {}
     family = _engine_family(engine or card.get("engine"))
-    endpoint = (endpoint or card.get("endpoint") or "").rstrip("/")
     model = model or card.get("model")
+    resolution = resolve_inspect_endpoint(
+        endpoint or card.get("endpoint"), card=card, peer_host=peer_host)
+    endpoint = (resolution.get("endpoint") or "").rstrip("/")
 
+    inventory_status = card.get("model_status")
     overview = {
         "model": model,
         "friendly_name": profile.get("friendly_name") or card.get("friendly_name") or model,
         "machine": card.get("machine"),
+        "machine_id": card.get("machine_id"),
         "engine": engine or card.get("engine"),
         "engine_family": family,
         "endpoint": endpoint or None,
-        "model_status": card.get("model_status"),
+        "configured_endpoint": resolution.get("configured_endpoint"),
+        "endpoint_resolved": bool(resolution.get("resolved")),
+        "endpoint_note": resolution.get("note"),
+        "model_status": inventory_status,
+        "inventory_model_status": inventory_status,
         "quantization": card.get("quantization"),
         "size_bytes": card.get("size_bytes"),
         "model_path": card.get("model_path"),
     }
 
-    backend = {"engine": family, "fields": {}, "errors": ["no endpoint"], "raw": {}}
-    if endpoint and model:
+    backend = {"engine": family, "fields": {}, "errors": [], "raw": {}}
+    if resolution.get("error"):
+        backend["errors"].append(resolution["error"])
+        backend["fields"]["model_status"] = _field(
+            None, source="endpoint resolution", layer="reported_effective")
+        backend["fields"]["model_status"]["display"] = STATUS_UNKNOWN
+        backend["fields"]["model_status"]["known"] = False
+    elif endpoint and model:
         if family == "ollama":
             backend = inspect_ollama_model(endpoint, model)
         elif family == "llama-server":
@@ -456,6 +589,23 @@ def inspect_model_configuration(*, engine: str | None, endpoint: str | None,
     elif not endpoint:
         backend = {"engine": family, "fields": {}, "raw": {},
                    "errors": ["No endpoint available for live inspection"]}
+
+    if resolution.get("note"):
+        backend.setdefault("errors", [])
+        # Informational — not a failure
+        backend.setdefault("notes", []).append(resolution["note"])
+
+    # Prefer live verified status; never invent unloaded from a failed probe.
+    live_status = (backend.get("fields") or {}).get("model_status") or {}
+    if live_status.get("known"):
+        overview["model_status"] = live_status.get("value")
+        overview["model_status_source"] = live_status.get("source")
+    elif live_status.get("display") == STATUS_UNKNOWN or resolution.get("error"):
+        overview["model_status"] = None
+        overview["model_status_display"] = STATUS_UNKNOWN
+        overview["model_status_source"] = "retrieval failed"
+    else:
+        overview["model_status_source"] = "inventory snapshot (not live-verified)"
 
     # Saved profile layers (never presented as live)
     profile_fields = {}
@@ -483,6 +633,7 @@ def inspect_model_configuration(*, engine: str | None, endpoint: str | None,
         "overview": overview,
         "backend": backend,
         "profile_fields": profile_fields,
+        "resolution": resolution,
         "layers_legend": {
             "model_default": "Defaults from the model / Modelfile / weights metadata",
             "server_configuration": "Stored launch/server configuration",
@@ -844,7 +995,7 @@ class DiagnosticStore:
         for r in reversed(rows):
             if model and r.get("model") != model:
                 continue
-            if machine and r.get("machine") != machine:
+            if machine and not machines_match(r.get("machine"), machine):
                 continue
             if engine and (r.get("engine") or "").lower() != engine.lower():
                 continue

@@ -5,6 +5,7 @@ import pytest
 
 from app import create_app
 from diagnostics import (
+    STATUS_UNKNOWN,
     DiagnosticStore,
     build_diagnostic_report,
     classify_stop_reason,
@@ -13,6 +14,8 @@ from diagnostics import (
     inspect_llama_server,
     inspect_model_configuration,
     inspect_ollama_model,
+    machines_match,
+    resolve_inspect_endpoint,
     sanitize_report,
     troubleshoot_record,
 )
@@ -289,6 +292,125 @@ def test_api_ingest_and_inspect(client, monkeypatch):
     assert "Diagnostic Report" in rep.get_json()["data"]["text"]
 
 
-def test_app_version_is_v33_dev():
+def test_app_version_is_v33():
     from app import APP_VERSION
     assert APP_VERSION.startswith("3.3")
+
+
+def test_resolve_remote_loopback_uses_registered_peer_host():
+    card = {
+        "is_self": False,
+        "machine": "Portable",
+        "machine_id": "9fec5e205088",
+        "endpoint": "http://127.0.0.1:11434",
+        "server_key": "127.0.0.1:11434",
+        "port": 11434,
+    }
+    r = resolve_inspect_endpoint(
+        card["endpoint"], card=card, peer_host="10.0.0.45")
+    assert r["resolved"] is True
+    assert r["endpoint"] == "http://10.0.0.45:11434"
+    assert r["configured_endpoint"] == "http://127.0.0.1:11434"
+    assert r["error"] is None
+
+
+def test_resolve_does_not_rewrite_self_loopback():
+    card = {"is_self": True, "endpoint": "http://127.0.0.1:11434"}
+    r = resolve_inspect_endpoint(
+        card["endpoint"], card=card, peer_host="10.0.0.45")
+    assert r["resolved"] is False
+    assert r["endpoint"] == "http://127.0.0.1:11434"
+
+
+def test_resolve_fails_without_peer_host():
+    card = {
+        "is_self": False, "machine": "Portable",
+        "endpoint": "http://127.0.0.1:11434", "port": 11434,
+    }
+    r = resolve_inspect_endpoint(card["endpoint"], card=card, peer_host=None)
+    assert r["endpoint"] is None
+    assert r["error"]
+
+
+def test_resolve_keeps_absolute_lan_endpoint():
+    card = {"is_self": False, "endpoint": "http://10.0.0.104:8080"}
+    r = resolve_inspect_endpoint(
+        card["endpoint"], card=card, peer_host="10.0.0.104")
+    assert r["endpoint"] == "http://10.0.0.104:8080"
+    assert r["resolved"] is False
+
+
+def test_ps_failure_is_status_unknown_not_unloaded(monkeypatch):
+    monkeypatch.setattr(
+        "diagnostics._post_json",
+        lambda *a, **k: (200, {"details": {}, "parameters": "", "model_info": {}}, None))
+    monkeypatch.setattr(
+        "diagnostics._fetch_json",
+        lambda url, timeout=4.0: (None, None, "TimeoutError: timed out")
+        if "/api/ps" in url else (200, {"version": "0.1"}, None))
+    out = inspect_ollama_model("http://10.0.0.45:11434", "deepseek-q8:latest")
+    st = out["fields"]["model_status"]
+    assert st["known"] is False
+    assert st["display"] == STATUS_UNKNOWN
+    assert st["value"] != "unloaded"
+
+
+def test_inspect_remote_card_rewrites_loopback(monkeypatch):
+    seen = {}
+
+    def fake_show(url, payload, timeout=4.0):
+        seen["show"] = url
+        return 200, {
+            "details": {"quantization_level": "Q8_0", "parameter_size": "9.2B"},
+            "parameters": "num_ctx 193000\n",
+            "model_info": {},
+            "capabilities": ["completion"],
+        }, None
+
+    def fake_get(url, timeout=4.0):
+        seen.setdefault("gets", []).append(url)
+        if url.endswith("/api/ps"):
+            return 200, {"models": []}, None
+        if url.endswith("/api/version"):
+            return 200, {"version": "0.32.15"}, None
+        return None, None, "skip"
+
+    monkeypatch.setattr("diagnostics._post_json", fake_show)
+    monkeypatch.setattr("diagnostics._fetch_json", fake_get)
+    insp = inspect_model_configuration(
+        engine="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="deepseek-q8:latest",
+        card={
+            "is_self": False,
+            "machine": "Portable",
+            "machine_id": "abc",
+            "model": "deepseek-q8:latest",
+            "endpoint": "http://127.0.0.1:11434",
+            "model_status": "loaded",  # inventory snapshot
+            "port": 11434,
+        },
+        peer_host="10.0.0.45",
+    )
+    assert "10.0.0.45:11434" in seen["show"]
+    assert insp["overview"]["endpoint"] == "http://10.0.0.45:11434"
+    assert insp["overview"]["endpoint_resolved"] is True
+    assert insp["backend"]["fields"]["quantization"]["value"] == "Q8_0"
+    # Live /api/ps says unloaded — must agree with live, not invent from failure
+    assert insp["overview"]["model_status"] == "unloaded"
+    assert insp["backend"]["fields"]["model_status"]["value"] == "unloaded"
+
+
+def test_machines_match_aliases():
+    assert machines_match("Portable", "Ubuntu Portable")
+    assert machines_match("Portable", "Windows") is False
+    assert machines_match("Windows", "Windows") is True
+
+
+def test_history_soft_machine_match(tmp_path):
+    store = DiagnosticStore(path=str(tmp_path / "h.json"), maxlen=20)
+    store.add({"ok": True, "model": "deepseek-q8:latest",
+               "machine": "Ubuntu Portable", "completion_tokens": 3,
+               "done_reason": "stop"})
+    rows = store.list(model="deepseek-q8:latest", machine="Portable", limit=5)
+    assert len(rows) == 1
