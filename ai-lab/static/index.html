@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FOXAI AI Lab Command Center</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261122c" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">FOXAI Family Hub</p>
+      <h1>AI Lab Command Center</h1>
+      <p class="sub">Servers, direct chat, model compare, and QR toolkit — local only.</p>
+    </div>
+    <div class="top-actions">
+      <button type="button" id="refresh-all">Refresh discovery</button>
+      <a class="btn" href="http://10.0.0.202:5000/" target="_blank" rel="noreferrer">Fleet Monitor</a>
+      <a class="btn" href="http://10.0.0.202:3002/" target="_blank" rel="noreferrer">Family Hub</a>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="AI Lab sections">
+    <button type="button" class="tab active" data-panel="servers">Servers</button>
+    <button type="button" class="tab" data-panel="chat">Direct Chat</button>
+    <button type="button" class="tab" data-panel="compare">Compare Models</button>
+    <button type="button" class="tab" data-panel="qr">QR Toolkit</button>
+  </nav>
+
+  <main>
+    <section id="panel-servers" class="panel active">
+      <div class="panel-head">
+        <h2>AI Lab — Servers &amp; Chat</h2>
+        <p id="servers-status" class="note">Discovering via Fleet Monitor…</p>
+      </div>
+      <div id="machine-strip" class="machine-strip"></div>
+      <div id="server-cards" class="cards"></div>
+    </section>
+
+    <section id="panel-chat" class="panel">
+      <div class="panel-head">
+        <h2>Direct AI Chat</h2>
+        <p class="note">Uses currently loaded models only. Nothing is auto-started or auto-loaded.</p>
+      </div>
+      <div class="chat-layout">
+        <aside class="chat-side">
+          <label>Server
+            <select id="chat-server"></select>
+          </label>
+          <label>Model
+            <select id="chat-model"></select>
+          </label>
+          <label>Thinking (Ollama)
+            <select id="chat-think">
+              <option value="auto">Automatic</option>
+              <option value="enabled">Enabled</option>
+              <option value="disabled" selected>Disabled</option>
+            </select>
+          </label>
+          <div id="chat-meta" class="note"></div>
+          <button type="button" id="chat-clear">Clear chat</button>
+        </aside>
+        <div class="chat-main">
+          <div id="chat-log" class="chat-log" aria-live="polite"></div>
+          <form id="chat-form" class="chat-form">
+            <textarea id="chat-input" rows="3" placeholder="Message the selected loaded model…"></textarea>
+            <button type="submit">Send</button>
+          </form>
+          <div id="chat-stats" class="note"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-compare" class="panel">
+      <div class="panel-head">
+        <h2>Compare Models</h2>
+        <p class="note">Same prompt to 2–3 discovered models. Loaded models are preferred; unloaded selections report errors instead of auto-loading replacements. Requests run independently.</p>
+      </div>
+      <div class="compare-controls">
+        <label>Model A <select id="cmp-a"></select></label>
+        <label>Model B <select id="cmp-b"></select></label>
+        <label>Model C (optional) <select id="cmp-c"><option value="">—</option></select></label>
+        <p id="cmp-same-note" class="note" aria-live="polite"></p>
+        <label class="grow">Prompt
+          <textarea id="cmp-prompt" rows="3" placeholder="Short comparison prompt…"></textarea>
+        </label>
+        <button type="button" id="cmp-run">Run comparison</button>
+      </div>
+      <div id="cmp-results" class="compare-grid"></div>
+    </section>
+
+    <section id="panel-qr" class="panel">
+      <div class="panel-head">
+        <h2>QR Toolkit — Generate &amp; Scan</h2>
+        <p class="note">Offline Kayock QR Generator. Decoded content is never auto-opened or executed.</p>
+      </div>
+      <div class="qr-actions">
+        <a class="btn primary" href="/qr/" target="_blank" rel="noreferrer">Open QR Generator</a>
+        <a class="btn primary" href="/qr/scan.html" target="_blank" rel="noreferrer">Open QR Scanner</a>
+      </div>
+      <div class="qr-apps">
+        <h3>QR for existing application links</h3>
+        <p class="note">Generate a local QR for Family Hub shortcuts and verified AI endpoints.</p>
+        <div class="row">
+          <select id="qr-link-select"></select>
+          <button type="button" id="qr-link-make">Show QR</button>
+        </div>
+        <div id="qr-link-preview" class="qr-preview"></div>
+        <div id="qr-link-status" class="note"></div>
+      </div>
+      <iframe class="qr-frame" title="Kayock QR Generator" src="/qr/"></iframe>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>FOXAI AI Lab · local Station service · port 3010</span>
+    <span id="foot-ts"></span>
+  </footer>
+  <script src="/qr/vendor/qrcode.js"></script>
+  <script src="/static/app.js?v=20261122c"></script>
+</body>
+</html>

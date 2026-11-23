@@ -53,12 +53,17 @@ MAX_MANAGED_SERVERS = 8
 MAX_LOG_LINES = 300
 MAX_BODY_BYTES = 512 * 1024
 
-# Well-known AI server ports probed when something listens on loopback.
+# Well-known AI server ports probed when something listens (loopback or
+# wildcard). Includes common lab endpoints; presence of a port here is a
+# discovery candidate only — connectivity is still verified by probing.
 KNOWN_AI_PORTS = {
     11434: "ollama",
     1234: "lm-studio",
     8080: "llama-server",
     8000: "lemonade",
+    13305: "lemonade",
+    1337: "openai",
+    12434: "llama-server",
 }
 
 # Process-name / cmdline hints -> server type. Matched case-insensitively on
@@ -591,25 +596,43 @@ class AIManager:
         return found
 
     def _find_listening_ports(self):
-        """{pid: [port, ...]} for listening TCP ports (localhost + wildcard).
-        Returns {} when the OS denies access (non-fatal)."""
+        """Return (pid_map, orphan_ports).
+
+        pid_map: {pid: [port, ...]} for listening TCP ports whose owning PID
+        is known. orphan_ports: set of listening ports with no PID (common for
+        Docker-published ports on Linux). Access denial returns empty results.
+        """
         mapping = {}
+        orphan_ports = set()
         try:
             conns = self.psutil.net_connections(kind="inet")
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
-            return mapping
+            return mapping, orphan_ports
         except Exception:
-            return mapping
+            return mapping, orphan_ports
         for c in conns or []:
             if c.status != self.psutil.CONN_LISTEN:
                 continue
             pid = getattr(c, "pid", None)
             laddr = getattr(c, "laddr", None)
             port = getattr(laddr, "port", None) if laddr else None
-            if not pid or not port:
+            if not port:
                 continue
-            mapping.setdefault(pid, []).append(int(port))
-        return mapping
+            port = int(port)
+            if not pid:
+                orphan_ports.add(port)
+                continue
+            mapping.setdefault(pid, []).append(port)
+        return mapping, orphan_ports
+
+    @staticmethod
+    def _valid_probe_port(port):
+        """True when port is a usable TCP port number for URL construction."""
+        try:
+            p = int(port)
+        except (TypeError, ValueError):
+            return False
+        return 1 <= p <= 65535
 
     def _probe_targets(self):
         """Combine configured servers + AI processes + known ports into probe
@@ -632,13 +655,23 @@ class AIManager:
             by_key.setdefault(key, t)
             return t
 
-        port_map = self._find_listening_ports()
+        port_map, orphan_ports = self._find_listening_ports()
+        all_listening = set(orphan_ports)
+        for pid, ports in port_map.items():
+            if pid == self._self_pid:
+                continue
+            all_listening.update(ports)
         ai_procs = self._find_ai_processes()
 
         # configured servers — authoritative, one target per config entry
         for cfg in list(self._config):
             host = cfg.get("host") or "127.0.0.1"
-            port = int(cfg.get("port") or 0)
+            try:
+                port = int(cfg.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if port and not self._valid_probe_port(port):
+                continue
             key = f"{host}:{port}" if port else f"cfg:{cfg.get('id')}"
             new_target(key, host, port or None, type_hint=cfg.get("type"),
                        name=cfg.get("name"), exe=cfg.get("exe") or None,
@@ -648,6 +681,8 @@ class AIManager:
         for pr in ai_procs:
             ports = [p for p in port_map.get(pr["pid"], []) if p != self._self_pid]
             port = ports[0] if ports else None
+            # Processes without a known listening port are still visible as
+            # "loading", but must never be HTTP-probed with port=None.
             key = f"127.0.0.1:{port}" if port else f"proc:{pr['pid']}"
             if key in by_key:
                 # a configured target already covers this endpoint — enrich it
@@ -666,6 +701,8 @@ class AIManager:
         for t in targets:
             if not t["port"]:
                 continue
+            if t["port"] in all_listening:
+                t["port_listening"] = True
             owner_pids = [pid for pid, ports in port_map.items()
                           if t["port"] in ports and pid != self._self_pid]
             if owner_pids:
@@ -674,24 +711,93 @@ class AIManager:
                     t["pid"] = owner_pids[0]
                     t["process_found"] = True
 
-        # known AI ports listening without any target yet (loopback only)
-        for pid, ports in port_map.items():
-            if pid == self._self_pid:
+        # known AI ports listening without any target yet — includes
+        # Docker-published ports that report no owning PID.
+        for port in sorted(all_listening):
+            if port not in KNOWN_AI_PORTS:
                 continue
-            for port in ports:
-                key = f"127.0.0.1:{port}"
-                if port in KNOWN_AI_PORTS and key not in by_key:
-                    t = new_target(key, "127.0.0.1", port,
-                                   type_hint=KNOWN_AI_PORTS[port], pid=pid,
-                                   port_listening=True, process_found=True)
-                    _ = t
+            key = f"127.0.0.1:{port}"
+            if key in by_key:
+                continue
+            owner = next((pid for pid, ports in port_map.items()
+                          if port in ports and pid != self._self_pid), None)
+            new_target(key, "127.0.0.1", port,
+                       type_hint=KNOWN_AI_PORTS[port], pid=owner,
+                       port_listening=True, process_found=bool(owner))
 
-        return targets
+        return self._dedupe_portless_processes(targets)
+
+    @staticmethod
+    def _dedupe_portless_processes(targets):
+        """Attach Docker-orphaned AI processes to same-type listening ports.
+
+        When Ollama (or similar) runs as a host process but Docker publishes
+        the TCP port with pid=None, discovery previously emitted both
+        ``proc:<pid>`` (loading, no port) and ``127.0.0.1:11434`` (online).
+        Merge them into one listening/online target.
+        """
+        listening_by_type = {}
+        for t in targets:
+            if t.get("port") and t.get("type_hint"):
+                listening_by_type.setdefault(t["type_hint"], []).append(t)
+
+        merged = []
+        for t in targets:
+            if t.get("port"):
+                merged.append(t)
+                continue
+            hint = t.get("type_hint")
+            attached = False
+            for cand in listening_by_type.get(hint, []):
+                if cand.get("pid") not in (None, t.get("pid")):
+                    continue
+                if cand.get("pid") is None:
+                    cand["pid"] = t.get("pid")
+                    cand["process_found"] = True
+                    for field in ("name", "exe", "cmdline", "create_time"):
+                        if t.get(field) and not cand.get(field):
+                            cand[field] = t.get(field)
+                attached = True
+                break
+            if not attached:
+                merged.append(t)
+        return merged
 
     # -- probe one target ------------------------------------------------------
     def _probe_one(self, target):
-        base = f"http://{target['host']}:{target['port']}"
+        host = target.get("host") or "127.0.0.1"
+        port = target.get("port")
         stype = target.get("type_hint") or "openai"
+
+        # Malformed discovery entries must never build InvalidURL payloads.
+        if not self._valid_probe_port(port):
+            record = {
+                "key": target.get("key") or f"proc:{target.get('pid') or 'unknown'}",
+                "name": target.get("name") or stype,
+                "type": stype,
+                "api_type": None,
+                "host": host,
+                "port": port,
+                "url": None,
+                "pid": target.get("pid"),
+                "exe": target.get("exe"),
+                "configured": target.get("configured", False),
+                "port_listening": False,
+                "process_found": bool(target.get("process_found")),
+                "http_status": None,
+                "latency_ms": None,
+                "api_error": "no listening port yet — skipped HTTP probe",
+                "probed_at": time.time(),
+            }
+            cfg = target.get("config")
+            if cfg:
+                record["id"] = cfg.get("id")
+            self._apply_status(record, target)
+            self._apply_process_metrics(record, target)
+            return record
+
+        port = int(port)
+        base = f"http://{host}:{port}"
         probe_fn = PROBES.get(stype, probe_openai_generic)
 
         info = {}
@@ -701,7 +807,11 @@ class AIManager:
 
         # health pre-probe: confirms the API answers and measures latency
         t0 = self._clock()
-        st, body, err = self._fetch(base + "/", self._probe_timeout)
+        try:
+            st, body, err = self._fetch(base + "/", self._probe_timeout)
+        except Exception as exc:
+            # urllib.InvalidURL and friends must not abort the scan cycle
+            st, body, err = None, None, f"{type(exc).__name__}: {exc}"
         latency_ms = round((self._clock() - t0) * 1000, 1)
         http_status = st
         if st is None and err:
@@ -723,8 +833,8 @@ class AIManager:
             "name": target.get("name") or info.get("api") or stype,
             "type": stype if info.get("api") else (info.get("api") or stype),
             "api_type": info.get("api"),
-            "host": target["host"],
-            "port": target["port"],
+            "host": host,
+            "port": port,
             "url": base,
             "pid": target.get("pid"),
             "exe": target.get("exe"),
@@ -1040,7 +1150,12 @@ class AIManager:
     def adopt_server(self, key):
         """Turn a discovered-but-unconfigured server into a configured one
         (pre-filled from the discovery record). This is the only way a
-        discovered server gains management controls."""
+        discovered server gains management controls.
+
+        Idempotent: if host:port is already registered, existing config is
+        preserved (no overwrite of exe/args). Registration alone does not
+        start/stop/load/unload anything.
+        """
         with self._lock:
             rec = next((r for r in self._records if r.get("key") == key), None)
         if not rec:
@@ -1048,12 +1163,28 @@ class AIManager:
         host = rec.get("host") or "127.0.0.1"
         if host not in LOCAL_HOSTS:
             return False, "only local servers can be adopted for management", []
+        try:
+            port = int(rec.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not 1 <= port <= 65535:
+            return False, f"invalid discovery port for key {key!r}", []
+        # Preserve existing registration for this endpoint
+        with self._lock:
+            for c in self._config:
+                if int(c.get("port") or 0) == port and \
+                        (c.get("host") or "127.0.0.1") == host:
+                    self.request_refresh()
+                    return True, "already registered", []
         return self.save_server_config({
             "id": uuid.uuid4().hex[:12],
-            "name": rec.get("name") or f"AI server @{rec.get('port')}",
+            "name": rec.get("name") or f"AI server @{port}",
             "type": rec.get("type") or "openai",
-            "host": host, "port": rec.get("port"),
-            "exe": rec.get("exe") or "",
+            "host": host, "port": port,
+            # Never copy discovery exe/args into a new registration.
+            # Process-control rights require an explicit Configure step so we
+            # do not adopt unrelated PIDs (e.g. ssh) by accident.
+            "exe": "",
             "args": "", "model_dir": "",
         })
 
@@ -1080,7 +1211,7 @@ class AIManager:
         match the configured path (case-insensitive on Windows)."""
         port = int(cfg.get("port") or 0)
         exe_cfg = os.path.normcase(os.path.abspath(cfg.get("exe") or ""))
-        port_map = self._find_listening_ports()
+        port_map, _orphan_ports = self._find_listening_ports()
         for pid, ports in port_map.items():
             if port and port not in ports:
                 continue
@@ -1220,7 +1351,7 @@ class AIManager:
         self.request_refresh()
         return True, f"stopped (pid {pid})", None
 
-    def restart_server(self, server_id, force=False):
+    def restart_server(self, server_id, force=False, model=None):
         ok, msg, tag = self.stop_server(server_id, force=force)
         if not ok:
             return False, msg, tag
@@ -1232,8 +1363,8 @@ class AIManager:
                 if not self._port_open(int(cfg["port"])):
                     break
                 self._sleeper(0.25)
-        ok2, msg2, model = self.start_server(server_id)
-        return ok2, f"restart: {msg}; {msg2}", model
+        ok2, msg2, started_model = self.start_server(server_id, model=model)
+        return ok2, f"restart: {msg}; {msg2}", started_model
 
     def _port_open(self, port, host="127.0.0.1"):
         try:

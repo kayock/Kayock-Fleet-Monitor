@@ -991,8 +991,11 @@ class GPUCollector:
         if top:
             result = {"available": False, "percent": None, "engines": {},
                       "reason": "intel_gpu_top could not read perf counters "
-                                "(needs permissions, e.g. run as root or "
-                                "grant perf_event_paranoid access)"}
+                                "(needs CAP_PERFMON / root, or "
+                                "kernel.perf_event_paranoid <= 2); i915 does "
+                                "not expose usable busy counters in sysfs on "
+                                "this host, so utilization is unavailable "
+                                "rather than estimated"}
             try:
                 proc = subprocess.run(
                     [top, "-J", "-s", "1000", "-n", "1", "-o", "-"], capture_output=True, text=True,

@@ -181,6 +181,58 @@ def is_loopback_name(name: str) -> bool:
     return n == "lo" or any(h in n for h in _LOOPBACK_HINTS)
 
 
+_VIRTUAL_FS_TYPES = {
+    "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2", "nsfs", "bpf",
+    "tracefs", "debugfs", "securityfs", "pstore", "efivarfs", "autofs",
+    "fusectl", "configfs", "mqueue", "hugetlbfs", "rpc_pipefs", "devpts",
+    "overlay", "aufs",
+}
+_SNAP_FS_TYPES = {"squashfs"}
+_IDLE_PROCESS_NAMES = {
+    "system idle process",  # Windows
+    "idle",                 # some Windows tools
+    "swapper/0",            # Linux kernel idle (rarely visible via psutil)
+}
+
+
+def classify_volume(device: str | None, mountpoint: str | None,
+                    fstype: str | None) -> str:
+    """Classify a mount as physical, snap, or virtual for dashboard filtering."""
+    fs = (fstype or "").lower()
+    mount = mountpoint or ""
+    dev = device or ""
+    if fs in _SNAP_FS_TYPES or mount.startswith("/snap/") or \
+            (dev.startswith("/dev/loop") and "/snap/" in mount):
+        return "snap"
+    if fs in _VIRTUAL_FS_TYPES or mount.startswith("/var/lib/docker/") or \
+            mount.startswith("/run/docker/"):
+        return "virtual"
+    if dev.startswith("/dev/loop") and fs and fs not in ("ext4", "xfs", "btrfs",
+                                                          "ntfs", "vfat", "exfat",
+                                                          "fat32", "fuseblk"):
+        return "virtual"
+    return "physical"
+
+
+def classify_adapter(name: str) -> str:
+    """Classify a NIC as physical, virtual, overlay, or loopback."""
+    if is_loopback_name(name):
+        return "loopback"
+    n = (name or "").lower()
+    if n.startswith(("br-", "veth", "virbr", "cni", "flannel", "weave",
+                     "tun", "tap", "docker", "lxc", "podman", "nerdctl")) \
+            or n in {"docker0", "lxcbr0", "cni0"} \
+            or "vethernet" in n or "hyper-v" in n:
+        return "virtual"
+    if "tailscale" in n or n.startswith(("wg", "zt", "tailscale")):
+        return "overlay"
+    return "physical"
+
+
+def is_idle_process_name(name: str | None) -> bool:
+    return (name or "").strip().lower() in _IDLE_PROCESS_NAMES
+
+
 # ---------------------------------------------------------------------------
 # The sampler
 # ---------------------------------------------------------------------------
@@ -432,14 +484,17 @@ class SystemSampler:
         try:
             parts = self.psutil.disk_partitions(all=False)
         except Exception as exc:
-            return {"volumes": [], "error": f"disk_partitions failed: {exc}"}
+            return {"volumes": [], "primary_volumes": [],
+                    "other_volumes": [], "error": f"disk_partitions failed: {exc}"}
         volumes = []
         for p in parts:
             if not p.fstype:  # pseudo mounts
                 continue
+            kind = classify_volume(p.device, p.mountpoint, p.fstype)
             entry = {"device": p.device, "mountpoint": p.mountpoint,
-                     "fstype": p.fstype, "opts": p.opts, "total": None,
-                     "used": None, "free": None, "percent": None, "error": None}
+                     "fstype": p.fstype, "opts": p.opts, "kind": kind,
+                     "total": None, "used": None, "free": None,
+                     "percent": None, "error": None}
             try:
                 u = self.psutil.disk_usage(p.mountpoint)
                 entry.update(total=u.total, used=u.used, free=u.free,
@@ -448,7 +503,10 @@ class SystemSampler:
                 # empty DVD drive, disconnected network share, ...
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             volumes.append(entry)
-        return {"volumes": volumes, "error": None}
+        primary = [v for v in volumes if v.get("kind") == "physical"]
+        other = [v for v in volumes if v.get("kind") != "physical"]
+        return {"volumes": volumes, "primary_volumes": primary,
+                "other_volumes": other, "error": None}
 
     def _collect_disk_io(self, elapsed):
         out = {"read_bps": None, "write_bps": None, "read_iops": None,
@@ -478,6 +536,7 @@ class SystemSampler:
 
     def _collect_network(self, elapsed):
         out = {"adapters": [], "totals": {"sent_bps": None, "recv_bps": None},
+               "physical_totals": {"sent_bps": None, "recv_bps": None},
                "total_bytes_sent": None, "total_bytes_recv": None,
                "available": False, "reason": None}
         try:
@@ -489,53 +548,93 @@ class SystemSampler:
             out["reason"] = "Network counters unavailable"
             return out
         current = normalize_net_counters(counters)
-        loopbacks = {n for n in current if is_loopback_name(n)}
+        kinds = {n: classify_adapter(n) for n in current}
+        # Exclude loopback + virtual bridges from the headline totals so the
+        # dashboard prioritizes physical LAN traffic.
+        skip_names = {n for n, kind in kinds.items()
+                      if kind in ("loopback", "virtual")}
         rates = compute_interface_rates(self._prev_net, current, elapsed,
-                                        skip_names=loopbacks)
+                                        skip_names=skip_names)
         self._prev_net = current
         out["totals"] = rates["totals"]
-        for name, cur in sorted(current.items()):
+        out["physical_totals"] = rates["totals"]
+        # Sort: physical first, then overlay, virtual, loopback
+        kind_order = {"physical": 0, "overlay": 1, "virtual": 2, "loopback": 3}
+        for name, cur in sorted(current.items(),
+                                key=lambda kv: (kind_order.get(kinds[kv[0]], 9),
+                                                kv[0])):
             r = rates["per_nic"].get(name, {})
+            kind = kinds[name]
             out["adapters"].append({
                 "name": name,
                 "bytes_sent": cur[0],
                 "bytes_recv": cur[1],
                 "sent_bps": r.get("sent_bps"),
                 "recv_bps": r.get("recv_bps"),
-                "is_loopback": name in loopbacks,
+                "is_loopback": kind == "loopback",
+                "kind": kind,
             })
         out["available"] = out["totals"]["sent_bps"] is not None \
             or out["totals"]["recv_bps"] is not None
-        non_lo = [a for a in out["adapters"] if not a["is_loopback"]]
-        out["total_bytes_sent"] = sum(a["bytes_sent"] for a in non_lo)
-        out["total_bytes_recv"] = sum(a["bytes_recv"] for a in non_lo)
+        physical = [a for a in out["adapters"] if a["kind"] == "physical"]
+        out["total_bytes_sent"] = sum(a["bytes_sent"] for a in physical)
+        out["total_bytes_recv"] = sum(a["bytes_recv"] for a in physical)
         return out
 
     def _collect_processes(self):
-        note = ("CPU% is per-core relative and can exceed 100% for "
-                "multi-threaded processes; memory% is of total RAM.")
+        note = ("Process CPU% is per-core relative (can exceed 100% for "
+                "multi-threaded processes). Aggregate CPU% in the header is "
+                "system-wide 0–100. Idle/system-idle processes are excluded "
+                "from rankings. Memory% is of total RAM.")
         rows = []
+        idle_skipped = 0
         try:
             procs = list(self.psutil.process_iter(
                 ["pid", "name", "cpu_percent", "memory_percent", "memory_info"]))
         except Exception as exc:
-            return {"list": [], "total": None, "error": str(exc), "note": note}
+            return {"list": [], "total": None, "error": str(exc), "note": note,
+                    "idle_excluded": 0}
+        skipped_inaccessible = 0
         for p in procs:
-            info = p.info
+            try:
+                info = p.info
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                skipped_inaccessible += 1
+                continue
+            except Exception:
+                skipped_inaccessible += 1
+                continue
+            name = info.get("name") or "<unknown>"
+            if is_idle_process_name(name):
+                idle_skipped += 1
+                continue
             mi = info.get("memory_info")
+            try:
+                cpu = info.get("cpu_percent")
+                mem = info.get("memory_percent")
+                rss = getattr(mi, "rss", None) if mi is not None else None
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                skipped_inaccessible += 1
+                continue
             rows.append({
                 "pid": info.get("pid"),
-                "name": info.get("name") or "<unknown>",
-                "cpu_percent": info.get("cpu_percent"),
-                "memory_percent": info.get("memory_percent"),
-                "rss": getattr(mi, "rss", None),
+                "name": name,
+                "cpu_percent": cpu,
+                "memory_percent": mem,
+                "rss": rss,
             })
-        total = len(rows)
+        total = len(rows) + idle_skipped + skipped_inaccessible
         rows.sort(key=lambda r: ((r["cpu_percent"] is None,
                                   -(r["cpu_percent"] or 0.0)),
                                  -(r["memory_percent"] or 0.0)))
+        if skipped_inaccessible:
+            note += (f" {skipped_inaccessible} inaccessible process(es) "
+                     "skipped during sampling.")
         return {"list": rows[:self.top_processes], "total": total,
-                "error": None, "note": note}
+                "error": None, "note": note, "idle_excluded": idle_skipped,
+                "inaccessible_skipped": skipped_inaccessible}
 
     # -- GPU section (non-blocking executor pattern) ----------------------------
     def _collect_gpu_section(self):
@@ -606,6 +705,8 @@ class SystemSampler:
             "cpu": cpu,
             "memory": memory,
             "storage": {"volumes": volumes["volumes"],
+                        "primary_volumes": volumes.get("primary_volumes") or [],
+                        "other_volumes": volumes.get("other_volumes") or [],
                         "volumes_error": volumes["error"],
                         "io": disk_io},
             "network": network,
@@ -654,12 +755,15 @@ class SystemSampler:
             "memory": {"total": None, "used": None, "available": None,
                        "percent": None, "swap_total": None, "swap_used": None,
                        "swap_percent": None},
-            "storage": {"volumes": [], "volumes_error": None, "io": None},
+            "storage": {"volumes": [], "primary_volumes": [], "other_volumes": [],
+                        "volumes_error": None, "io": None},
             "network": {"adapters": [],
                         "totals": {"sent_bps": None, "recv_bps": None},
+                        "physical_totals": {"sent_bps": None, "recv_bps": None},
                         "total_bytes_sent": None, "total_bytes_recv": None,
                         "available": False, "reason": "waiting for first sample"},
-            "processes": {"list": [], "total": None, "error": None, "note": ""},
+            "processes": {"list": [], "total": None, "error": None, "note": "",
+                          "idle_excluded": 0, "inaccessible_skipped": 0},
             "gpu": gpu_placeholder(),
             "histories": {k: [] for k in _HISTORY_KEYS},
             "refresh_seconds": self.refresh_seconds,

@@ -3,17 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Windows System Monitor</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <title>{{ machine_label }} — {{ app_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ app_version }}">
   <script>
     // Injected server constants (single source of truth for the browser loop)
     window.MONITOR_CONFIG = {
       refreshMs: {{ refresh_ms }},
-      historyLen: {{ history_len }}
+      historyLen: {{ history_len }},
+      appVersion: "{{ app_version }}"
     };
   </script>
-  <script src="{{ url_for('static', filename='js/plotly.min.js') }}"></script>
-  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='js/plotly.min.js') }}?v={{ app_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}?v={{ app_version }}" defer></script>
 </head>
 <body>
   <div id="loading-overlay">
@@ -107,6 +108,95 @@
     </section>
   </div>
 
+  <!-- ===== Model Control Center (fleet-wide) ===== -->
+  <div id="view-mcc" hidden>
+    <section class="card card-ai" id="card-mcc">
+      <div class="card-head">
+        <h2>Model Control Center</h2>
+        <div class="headline">
+          <span class="status-chip" id="mcc-status">loading…</span>
+          <span class="sort-tabs">
+            <button type="button" class="tab mcc-mode active" data-mcc-mode="simple">Simple</button>
+            <button type="button" class="tab mcc-mode" data-mcc-mode="advanced">Advanced</button>
+            <button type="button" class="tab mcc-mode" data-mcc-mode="expert">Expert</button>
+            <button type="button" class="tab" id="mcc-refresh">⟳ Refresh</button>
+          </span>
+        </div>
+      </div>
+      <p class="note" id="mcc-intro">
+        Manage models across your fleet. Register each inference server once — its models inherit capabilities.
+        Sync builds persistent profiles. Nothing loads, unloads, or restarts until you confirm.
+      </p>
+      <div id="mcc-mgmt-summary" class="mcc-profile-panel note" hidden></div>
+      <div class="mcc-toolbar">
+        <div class="sort-tabs" id="mcc-machine-filters">
+          <button type="button" class="tab active" data-mcc-machine="all">All machines</button>
+        </div>
+        <input id="mcc-search" class="search-input" type="search"
+               placeholder="search name, model, engine, machine, tags…" autocomplete="off">
+        <select id="mcc-filter" class="ai-model-select">
+          <option value="all">all models</option>
+          <option value="loaded">loaded</option>
+          <option value="unloaded">unloaded</option>
+          <option value="manageable">manageable</option>
+          <option value="needs_setup">needs setup</option>
+          <option value="protected">protected</option>
+        </select>
+        <select id="mcc-profile-select" class="ai-model-select" title="Saved profiles">
+          <option value="">— profile —</option>
+        </select>
+        <button type="button" class="btn" id="mcc-fleet-setup">Configure Fleet Management</button>
+        <button type="button" class="btn small" id="mcc-sync-profiles">Sync Model Profiles</button>
+        <button type="button" class="btn small" id="mcc-profile-preview">Preview profile</button>
+        <button type="button" class="btn small" id="mcc-profile-new">New profile</button>
+      </div>
+      <div id="mcc-sync-summary" class="mcc-profile-panel note" hidden></div>
+      <div id="mcc-profile-panel" class="mcc-profile-panel note" hidden></div>
+      <div id="mcc-settings-panel" class="mcc-settings-panel" hidden></div>
+      <div id="mcc-cards" class="mcc-grid"></div>
+      <div class="note">
+        Remote Load/Unload require <b>Allow remote control</b> on that machine.
+        llama-server cannot unload a model while leaving the server running — use Restart / Stop.
+      </div>
+    </section>
+  </div>
+
+  <!-- MCC settings / confirm modal -->
+  <div class="modal-overlay" id="mcc-modal" hidden>
+    <div class="modal mcc-modal">
+      <div class="modal-head">
+        <h3 id="mcc-modal-title">Model settings</h3>
+        <button class="tab" id="mcc-modal-close" type="button">✕</button>
+      </div>
+      <div class="modal-body" id="mcc-modal-body"></div>
+      <!-- Placeholder ids for static-asset id agreement; rebuilt when Settings opens. -->
+      <select id="mcc-quick-template" hidden aria-hidden="true"></select>
+      <input id="mcc-protected-toggle" type="checkbox" hidden aria-hidden="true">
+      <input id="mcc-tags-input" type="text" hidden aria-hidden="true">
+      <div class="modal-foot">
+        <button class="tab" id="mcc-modal-cancel" type="button">Cancel</button>
+        <button class="tab" id="mcc-modal-save-profile" type="button">Save Profile</button>
+        <button class="tab" id="mcc-modal-apply-supported" type="button">Apply Supported Changes</button>
+        <button class="tab" id="mcc-modal-apply-restart" type="button">Apply With Restart</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fleet-wide management setup wizard -->
+  <div class="modal-overlay" id="mcc-fleet-modal" hidden>
+    <div class="modal mcc-modal" style="max-width:920px">
+      <div class="modal-head">
+        <h3 id="mcc-fleet-modal-title">Configure Fleet Management</h3>
+        <button class="tab" id="mcc-fleet-modal-close" type="button">✕</button>
+      </div>
+      <div class="modal-body" id="mcc-fleet-modal-body"></div>
+      <div class="modal-foot">
+        <button class="tab" id="mcc-fleet-modal-cancel" type="button">Cancel</button>
+        <button class="tab" id="mcc-fleet-modal-apply" type="button">Configure Selected Servers</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== System + local AI servers (this machine OR a fleet machine) ===== -->
   <div id="view-machine">
   <main class="grid">
@@ -193,6 +283,15 @@
           <tbody id="volumes-tbody"></tbody>
         </table>
       </div>
+      <details id="volumes-other-details" class="soft-details" hidden>
+        <summary id="volumes-other-summary">Show Snap / virtual mounts</summary>
+        <div class="table-scroll">
+          <table class="tbl">
+            <thead><tr><th>Volume</th><th>Kind</th><th>File system</th><th>Total</th><th>Used</th><th>Free</th><th>Use</th></tr></thead>
+            <tbody id="volumes-other-tbody"></tbody>
+          </table>
+        </div>
+      </details>
       <div class="note" id="volumes-note"></div>
       <div class="mini" id="disk-totals"></div>
       <div class="chart" id="disk-chart"></div>
@@ -215,7 +314,16 @@
           <tbody id="net-tbody"></tbody>
         </table>
       </div>
-      <div class="note" id="net-note">Rates are bytes/sec deltas; totals are cumulative since boot.</div>
+      <details id="net-other-details" class="soft-details" hidden>
+        <summary id="net-other-summary">Show virtual / loopback adapters</summary>
+        <div class="table-scroll">
+          <table class="tbl">
+            <thead><tr><th>Adapter</th><th>Kind</th><th>↓ rate</th><th>↑ rate</th><th>↓ total</th><th>↑ total</th></tr></thead>
+            <tbody id="net-other-tbody"></tbody>
+          </table>
+        </div>
+      </details>
+      <div class="note" id="net-note">Rates are bytes/sec deltas; headline totals prioritize physical LAN adapters.</div>
       <div class="chart" id="net-chart"></div>
     </section>
 
@@ -233,7 +341,7 @@
       </div>
       <div class="table-scroll proc-scroll">
         <table class="tbl">
-          <thead><tr><th>PID</th><th>Name</th><th>CPU %</th><th>Memory %</th><th>RAM</th></tr></thead>
+          <thead><tr><th>PID</th><th>Name</th><th>CPU % (per-core)</th><th>Memory %</th><th>RAM</th></tr></thead>
           <tbody id="proc-tbody"></tbody>
         </table>
       </div>

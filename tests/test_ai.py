@@ -501,3 +501,74 @@ def test_refresh_request_is_thread_safe_flag(tmp_path):
     mgr.request_refresh()
     mgr.request_refresh()
     assert mgr._refresh_requested is True  # consumed by the loop thread
+
+
+def test_discovery_orphan_known_port_without_pid(tmp_path):
+    """Docker-published ports often report pid=None — still discover them."""
+    psutil = FakePsutil(processes=[], conns=[FakeConn(None, 11434)])
+
+    def fetch(url, timeout):
+        if url.endswith("/api/tags"):
+            return 200, __import__("json").dumps(OLLAMA_TAGS), None
+        if url.endswith("/api/ps"):
+            return 200, '{"models":[]}', None
+        return 200, "{}", None
+
+    mgr = make_manager(tmp_path, fetch=fetch, psutil_module=psutil)
+    mgr._scan_cycle()
+    servers = mgr.snapshot()["servers"]
+    assert len(servers) == 1
+    assert servers[0]["type"] == "ollama"
+    assert servers[0]["port"] == 11434
+    assert servers[0]["status"] != "error"
+
+
+def test_probe_skips_missing_port_without_invalid_url(tmp_path):
+    """AI processes with no listening port must not build http://host:None."""
+    exe = "/usr/bin/ollama"
+    psutil = FakePsutil(processes=[FakeProcObj(4242, exe=exe)], conns=[])
+    mgr = make_manager(tmp_path, psutil_module=psutil)
+    mgr._scan_cycle()
+    servers = mgr.snapshot()["servers"]
+    assert len(servers) == 1
+    assert servers[0]["port"] is None
+    assert servers[0].get("url") is None
+    assert "InvalidURL" not in (servers[0].get("status_detail") or "")
+    assert servers[0]["status"] in ("loading", "offline", "error")
+    assert servers[0]["key"] != "unknown"
+
+
+def test_discovery_dedupes_portless_process_onto_docker_port(tmp_path):
+    """Host ollama PID + Docker-published 11434 (pid=None) → one target."""
+    exe = "/usr/bin/ollama"
+    psutil = FakePsutil(
+        processes=[FakeProcObj(4242, exe=exe)],
+        conns=[FakeConn(None, 11434)],
+    )
+
+    def fetch(url, timeout):
+        if url.endswith("/api/tags"):
+            return 200, __import__("json").dumps(OLLAMA_TAGS), None
+        if url.endswith("/api/ps"):
+            return 200, '{"models":[]}', None
+        return 200, "{}", None
+
+    mgr = make_manager(tmp_path, fetch=fetch, psutil_module=psutil)
+    mgr._scan_cycle()
+    servers = mgr.snapshot()["servers"]
+    assert len(servers) == 1
+    assert servers[0]["port"] == 11434
+    assert servers[0]["pid"] == 4242
+    assert servers[0]["type"] == "ollama"
+    assert not any(str(s.get("key") or "").startswith("proc:") for s in servers)
+
+
+def test_invalid_configured_port_is_skipped(tmp_path):
+    mgr = make_manager(tmp_path)
+    ok, msg, warn = mgr.save_server_config(
+        {"name": "bad", "type": "ollama", "host": "127.0.0.1", "port": "None"})
+    # save may coerce or reject; either way probing must not raise InvalidURL
+    mgr._scan_cycle()
+    for s in mgr.snapshot()["servers"]:
+        assert "InvalidURL" not in (s.get("status_detail") or "")
+        assert s.get("url") is None or ":None" not in str(s.get("url"))

@@ -158,14 +158,21 @@ class FleetManager:
         return removed, ("deleted" if removed else "unknown machine id")
 
     # -- remote control proxy ---------------------------------------------------
-    def control_request(self, machine_id, remote_path, payload, timeout=12.0):
+    def control_request(self, machine_id, remote_path, payload=None,
+                        timeout=12.0, method: str = "POST"):
         """Forward a management action to a peer. Refused BEFORE any network
         activity unless the operator enabled allow_control for that machine.
         remote_path must be one of the whitelisted /api/ai/... actions."""
+        method = (method or "POST").upper()
         allowed_suffixes = ("/start", "/stop", "/restart", "/load", "/unload",
-                            "/adopt", "/discovery/refresh")
+                            "/adopt", "/discovery/refresh", "/models", "/logs")
         if not any(remote_path.endswith(sfx) for sfx in allowed_suffixes):
             return 403, {"ok": False, "message": "action not whitelisted"}
+        # Read-only model/log listing may use GET; mutating actions stay POST.
+        if method == "GET" and not remote_path.endswith(("/models", "/logs")):
+            return 403, {"ok": False, "message": "GET not allowed for this action"}
+        if method != "GET" and method != "POST":
+            return 405, {"ok": False, "message": "method not allowed"}
         with self._lock:
             m = next((x for x in self._machines if x.get("id") == machine_id),
                      None)
@@ -177,7 +184,11 @@ class FleetManager:
                                      f"'{m.get('name')}' — enable it in the "
                                      f"machine's configuration first")}
         url = f"http://{m['host']}:{m['port']}{remote_path}"
-        status, body, error = self._post(url, payload or {}, timeout)
+        if method == "GET":
+            fetch = self._fetch or self._default_fetch
+            status, body, error = fetch(url, timeout)
+        else:
+            status, body, error = self._post(url, payload or {}, timeout)
         if status is None:
             return 502, {"ok": False,
                          "message": f"peer unreachable: {error}"}
@@ -467,6 +478,14 @@ class FleetManager:
                     "peer_count": len(self._peers)}
 
     # -- snapshot -------------------------------------------------------------
+    def request_poll(self):
+        """Ask the poller to refresh peer snapshots on the next loop tick."""
+        self._next_poll = 0.0
+
+    def poll_now(self):
+        """Synchronously refresh peer /metrics caches (for post-adopt verify)."""
+        self._poll_all()
+
     def detail(self, machine_id):
         with self._lock:
             s = self._status.get(machine_id)

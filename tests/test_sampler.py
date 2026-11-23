@@ -278,3 +278,47 @@ def test_memory_and_meta_values(sampler, fake_clock):
     assert meta["architecture"]
     assert meta["boot_time"] == 1_737_200_000.0
     assert meta["uptime_seconds"] > 0
+
+
+def test_idle_process_excluded_from_rankings(sampler, fake_psutil):
+    from tests.conftest import FakeProcess, FakePc
+    fake_psutil.processes = [
+        FakeProcess({"pid": 0, "name": "System Idle Process", "cpu_percent": 1500.0,
+                     "memory_percent": 0.0, "memory_info": FakePc(rss=0)}),
+        FakeProcess({"pid": 100, "name": "python.exe", "cpu_percent": 22.0,
+                     "memory_percent": 3.0, "memory_info": FakePc(rss=10 * 2**20)}),
+    ]
+    out = sampler._collect_processes()
+    names = [r["name"] for r in out["list"]]
+    assert "System Idle Process" not in names
+    assert "python.exe" in names
+    assert out["idle_excluded"] == 1
+
+
+def test_inaccessible_process_does_not_crash_collector(sampler, fake_psutil):
+    class Boom:
+        @property
+        def info(self):
+            raise fake_psutil.AccessDenied if hasattr(fake_psutil, "AccessDenied") else PermissionError("denied")
+
+    # Use real psutil exception types via sampler.psutil
+    import psutil as real_psutil
+
+    class BadProc:
+        @property
+        def info(self):
+            raise real_psutil.AccessDenied(pid=1)
+
+    class Good:
+        def __init__(self):
+            self.info = {"pid": 9, "name": "ok", "cpu_percent": 1.0,
+                         "memory_percent": 1.0, "memory_info": type("M", (), {"rss": 1})()}
+
+    def fake_iter(attrs=None, ad_value=None):
+        return [BadProc(), Good()]
+
+    sampler.psutil.process_iter = fake_iter
+    out = sampler._collect_processes()
+    assert out["error"] is None
+    assert any(r["name"] == "ok" for r in out["list"])
+    assert out.get("inaccessible_skipped", 0) >= 1

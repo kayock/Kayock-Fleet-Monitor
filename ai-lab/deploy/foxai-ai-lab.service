@@ -1,0 +1,15 @@
+[Unit]
+Description=FOXAI AI Lab Command Center (localhost:3010)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Applications/FoxaiAiLab
+Environment=AI_LAB_HOST=0.0.0.0
+Environment=AI_LAB_PORT=3010
+ExecStart=%h/Applications/FoxaiAiLab/start.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
