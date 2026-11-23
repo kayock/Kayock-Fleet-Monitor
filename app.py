@@ -31,8 +31,10 @@ from flask import Flask, jsonify, render_template, request
 
 from ai import AIManager
 from fleet import FleetManager
-from mcc import (ProfileStore, build_model_cards, capabilities_for,
-                 estimate_memory_warning, preview_apply_profile, settings_view)
+from mcc import (ProfileStore, attach_profiles_to_cards, build_model_cards,
+                 capabilities_for, classify_pending_for_apply,
+                 estimate_memory_warning, management_setup_preview,
+                 merge_startup_args, preview_apply_profile, settings_view)
 from sampler import HISTORY_LEN, REFRESH_SECONDS, SystemSampler
 from utils import utc_now_iso
 
@@ -40,7 +42,7 @@ _werkzeug_log = logging.getLogger("werkzeug")
 _werkzeug_log.setLevel(logging.WARNING)  # avoid a log line every 2 s poll
 
 APP_NAME = "Kayock Fleet Monitor"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 
 
 def _json_result(ok, message, data=None, status=200):
@@ -252,19 +254,8 @@ def create_app(sampler: SystemSampler | None = None,
     # ---------------- Model Control Center API ----------------
     profile_store = ProfileStore()
 
-    @app.route("/api/mcc/capabilities", methods=["GET"])
-    def mcc_capabilities_all():
-        engines = request.args.get("engine")
-        if engines:
-            return jsonify({"ok": True, "data": capabilities_for(engines)})
-        from mcc import ENGINE_CAPABILITIES
-        return jsonify({"ok": True, "data": {
-            k: capabilities_for(k) for k in ENGINE_CAPABILITIES
-        }})
-
-    @app.route("/api/mcc/inventory", methods=["GET"])
-    def mcc_inventory():
-        """Fleet-wide model cards built from local + peer cached snapshots."""
+    def _mcc_gather_cards():
+        """Build fleet-wide cards and attach saved profiles (read-only)."""
         self_label = machine_label or socket.gethostname()
         local_ai = ai_manager.snapshot()
         local_sys = sampler.snapshot()
@@ -273,20 +264,16 @@ def create_app(sampler: SystemSampler | None = None,
             is_self=True, servers=local_ai.get("servers") or [],
             memory=local_sys.get("memory"), gpu=local_sys.get("gpu"),
         )
-        # Attach live ops onto matching server cards
         ops = local_ai.get("ops") or {}
         for c in cards:
             if c.get("server_id") and c["server_id"] in ops:
                 c["ops"] = ops[c["server_id"]]
 
-        machines = fleet_manager.list_machines()
-        # Prefer detail caches via list + detail()
-        for m in machines:
+        for m in fleet_manager.list_machines():
             mid = m.get("id")
             wrap = fleet_manager.detail(mid) or {}
             metrics = wrap.get("detail") if isinstance(wrap.get("detail"), dict) else {}
             ai = metrics.get("ai_servers") or {}
-            # Merge config args from peer config list when present
             peer_cfg = {c.get("id"): c for c in (ai.get("config") or [])
                         if isinstance(c, dict) and c.get("id")}
             servers = []
@@ -303,7 +290,6 @@ def create_app(sampler: SystemSampler | None = None,
                 memory=metrics.get("memory"), gpu=metrics.get("gpu"),
             ))
 
-        # Deduplicate by card id
         seen = set()
         uniq = []
         for c in cards:
@@ -312,26 +298,290 @@ def create_app(sampler: SystemSampler | None = None,
                 continue
             seen.add(cid)
             uniq.append(c)
+        uniq = attach_profiles_to_cards(uniq, profile_store.list_profiles())
+        return uniq, self_label, local_sys
+
+    @app.route("/api/mcc/capabilities", methods=["GET"])
+    def mcc_capabilities_all():
+        engines = request.args.get("engine")
+        if engines:
+            return jsonify({"ok": True, "data": capabilities_for(engines)})
+        from mcc import ENGINE_CAPABILITIES
+        return jsonify({"ok": True, "data": {
+            k: capabilities_for(k) for k in ENGINE_CAPABILITIES
+        }})
+
+    @app.route("/api/mcc/inventory", methods=["GET"])
+    def mcc_inventory():
+        """Fleet-wide model cards built from local + peer cached snapshots."""
+        uniq, self_label, local_sys = _mcc_gather_cards()
         return jsonify({
             "ok": True,
             "data": {
                 "cards": uniq,
                 "self_label": self_label,
+                "profiles_count": len(profile_store.list_profiles()),
                 "ts": local_sys.get("ts") or local_sys.get("collected_at"),
+            },
+        })
+
+    @app.route("/api/mcc/profiles/sync", methods=["POST"])
+    def mcc_profiles_sync():
+        """Non-destructive inventory → profile sync. Never mutates engines."""
+        cards, _, _ = _mcc_gather_cards()
+        summary = profile_store.sync_from_cards(cards)
+        cards2, self_label, _ = _mcc_gather_cards()
+        return jsonify({
+            "ok": True,
+            "message": "profiles synchronized",
+            "data": {
+                "summary": summary,
+                "cards": cards2,
+                "profiles": profile_store.list_profiles(),
+                "self_label": self_label,
             },
         })
 
     @app.route("/api/mcc/settings/preview", methods=["POST"])
     def mcc_settings_preview():
         body = request.get_json(silent=True) or {}
+        pending = body.get("pending") or {}
         view = settings_view(
             engine=body.get("engine"),
             configured_args=body.get("configured_args"),
             live_context=body.get("live_context"),
             live_model=body.get("live_model"),
-            pending=body.get("pending") or {},
+            pending=pending,
         )
+        view["classification"] = classify_pending_for_apply(
+            body.get("engine"), pending)
         return jsonify({"ok": True, "data": view})
+
+    @app.route("/api/mcc/settings/apply", methods=["POST"])
+    def mcc_settings_apply():
+        """Apply pending settings through supported pathways only.
+
+        Modes:
+          - save_profile: persist prefs only (no engine mutation)
+          - supported: save request-level prefs to the model profile
+          - with_restart: merge known startup args into local ai_servers.json
+            and optionally restart (requires confirm_restart=true)
+        """
+        body = request.get_json(silent=True) or {}
+        mode = (body.get("mode") or "supported").strip()
+        pending = dict(body.get("pending") or {})
+        engine = body.get("engine")
+        configured_args = body.get("configured_args")
+        server_id = body.get("server_id")
+        is_self = bool(body.get("is_self", True))
+        confirm_restart = bool(body.get("confirm_restart"))
+        confirm_disruptive = bool(body.get("confirm_disruptive"))
+        protected = bool(body.get("protected"))
+        profile_id = body.get("profile_id")
+        identity = body.get("identity") or {}
+
+        if protected and mode == "with_restart" and not confirm_disruptive:
+            return _json_result(False,
+                "Protected model — confirm disruptive restart explicitly "
+                "(confirm_disruptive=true).",
+                {"needs_confirm": True, "protected": True}, status=409)
+
+        classification = classify_pending_for_apply(engine, pending)
+        view = settings_view(
+            engine=engine, configured_args=configured_args,
+            live_context=body.get("live_context"),
+            live_model=body.get("live_model") or body.get("model"),
+            pending=pending,
+        )
+        results = {
+            "mode": mode,
+            "applied": [],
+            "saved": [],
+            "pending": [],
+            "skipped": [],
+            "restart_performed": False,
+            "new_args": None,
+            "classification": classification,
+            "preview": view,
+        }
+
+        # Resolve / create profile for this identity
+        profile = profile_store.get(profile_id) if profile_id else None
+        if not profile and identity.get("key"):
+            profile = profile_store.get_by_identity(identity["key"])
+
+        def _persist_prefs(req_prefs, startup_prefs):
+            nonlocal profile
+            entry = {
+                "id": (profile or {}).get("id"),
+                "name": (body.get("friendly_name")
+                         or (profile or {}).get("friendly_name")
+                         or body.get("model") or "model"),
+                "friendly_name": (body.get("friendly_name")
+                                  or (profile or {}).get("friendly_name")
+                                  or body.get("model")),
+                "engine": engine or (profile or {}).get("engine"),
+                "model": body.get("model") or (profile or {}).get("model"),
+                "machine": body.get("machine") or (profile or {}).get("machine"),
+                "machine_id": body.get("machine_id") if "machine_id" in body
+                    else (profile or {}).get("machine_id"),
+                "server_id": server_id or (profile or {}).get("server_id"),
+                "identity": identity or (profile or {}).get("identity") or {},
+                "request_settings": {
+                    **((profile or {}).get("request_settings") or {}),
+                    **req_prefs,
+                },
+                "startup_settings": {
+                    **((profile or {}).get("startup_settings") or {}),
+                    **startup_prefs,
+                },
+                "settings": {
+                    **((profile or {}).get("settings") or {}),
+                    **req_prefs, **startup_prefs,
+                },
+                "user_customized": True,
+                "protected": protected if "protected" in body
+                    else bool((profile or {}).get("protected")),
+            }
+            ok, msg, saved = profile_store.save(entry)
+            if ok:
+                profile = saved
+                for k in req_prefs:
+                    results["saved"].append({
+                        "parameter": k, "value": req_prefs[k],
+                        "as": "request_preference",
+                        "note": "Saved to profile — clients/apps must send this per request.",
+                    })
+                for k in startup_prefs:
+                    results["saved"].append({
+                        "parameter": k, "value": startup_prefs[k],
+                        "as": "startup_preference",
+                        "note": "Saved to profile — not live until applied with restart.",
+                    })
+            else:
+                results["skipped"].append({"reason": f"profile save failed: {msg}"})
+            return ok
+
+        if mode == "save_profile":
+            _persist_prefs(
+                classification["request_preferences"],
+                classification["startup_settings"])
+            for k, meta in classification["unsupported"].items():
+                results["skipped"].append({
+                    "parameter": k, "reason": meta.get("reason")})
+            return jsonify({"ok": True, "message": "profile saved", "data": results})
+
+        if mode == "supported":
+            # Persist request prefs; report startup as needing Apply With Restart
+            _persist_prefs(classification["request_preferences"], {})
+            for k, v in classification["startup_settings"].items():
+                results["pending"].append({
+                    "parameter": k, "value": v,
+                    "reason": "Requires Apply With Restart (startup setting).",
+                })
+            for k, meta in {**classification["unsupported"],
+                            **classification["unknown"]}.items():
+                results["skipped"].append({
+                    "parameter": k,
+                    "reason": meta.get("reason") if isinstance(meta, dict)
+                    else "unsupported",
+                })
+            msg = ("Request preferences saved to profile."
+                   if results["saved"]
+                   else "No immediately supported changes to apply.")
+            if results["pending"]:
+                msg += " Some settings need Apply With Restart."
+            return jsonify({"ok": True, "message": msg, "data": results})
+
+        if mode == "with_restart":
+            if not classification["startup_settings"] and not classification["request_preferences"]:
+                return _json_result(False, "nothing to apply", results)
+            _persist_prefs(
+                classification["request_preferences"],
+                classification["startup_settings"])
+
+            if not classification["startup_settings"]:
+                return jsonify({
+                    "ok": True,
+                    "message": "Only request preferences were present — saved to profile; no restart.",
+                    "data": results,
+                })
+
+            if not is_self:
+                results["skipped"].append({
+                    "reason": (
+                        "Startup argument edits apply only on the machine that "
+                        "owns ai_servers.json. Open Model Control on that peer "
+                        "(or edit Configure there), then restart."
+                    ),
+                })
+                return jsonify({
+                    "ok": False,
+                    "message": "Remote startup-arg rewrite is not proxied — do it on the peer.",
+                    "data": results,
+                }), 400
+
+            if not server_id:
+                return _json_result(False,
+                    "No configured server_id — adopt/configure the server first.",
+                    results)
+
+            cfg = next((c for c in ai_manager.list_config()
+                        if c.get("id") == server_id), None)
+            if not cfg:
+                return _json_result(False, "unknown local server_id", results)
+
+            existing_args = cfg.get("args") or configured_args or ""
+            new_args, notes = merge_startup_args(
+                existing_args, dict(classification["startup_settings"]), engine)
+            results["new_args"] = new_args
+            results["arg_notes"] = notes
+
+            if not confirm_restart:
+                results["needs_confirm"] = True
+                return jsonify({
+                    "ok": True,
+                    "message": "Preview ready — re-submit with confirm_restart=true to save args"
+                               + (" and restart" if body.get("do_restart") else ""),
+                    "data": results,
+                })
+
+            # Save merged args into existing config (preserve unrelated fields)
+            updated = dict(cfg)
+            updated["args"] = new_args
+            ok, msg, warnings = ai_manager.save_server_config(updated)
+            if not ok:
+                return _json_result(False, f"failed to save args: {msg}", results)
+            for n in notes:
+                results["applied"].append({"change": n, "as": "configured_args"})
+            results["warnings"] = warnings
+
+            do_restart = bool(body.get("do_restart", True))
+            if do_restart:
+                rok, rmsg, tag = ai_manager.restart_server(
+                    server_id, force=bool(body.get("force")),
+                    model=body.get("model"))
+                results["restart_performed"] = bool(rok)
+                results["restart_message"] = rmsg
+                results["restart_detail"] = tag
+                if not rok:
+                    return jsonify({
+                        "ok": False,
+                        "message": f"Args saved but restart failed: {rmsg}",
+                        "data": results,
+                    }), (409 if tag == "busy" else 400)
+                return jsonify({
+                    "ok": True,
+                    "message": "Startup settings saved and server restarted.",
+                    "data": results,
+                })
+            return jsonify({
+                "ok": True,
+                "message": "Startup settings saved to ai_servers.json (restart not requested).",
+                "data": results,
+            })
+
+        return _json_result(False, f"unknown mode {mode!r}", results)
 
     @app.route("/api/mcc/memory-warning", methods=["POST"])
     def mcc_memory_warning():
@@ -343,6 +593,38 @@ def create_app(sampler: SystemSampler | None = None,
             context_tokens=body.get("context_tokens"),
         )
         return jsonify({"ok": True, "data": warn})
+
+    @app.route("/api/mcc/setup/preview", methods=["POST"])
+    def mcc_setup_preview():
+        body = request.get_json(silent=True) or {}
+        card = body.get("card") or body
+        return jsonify({"ok": True, "data": management_setup_preview(card)})
+
+    @app.route("/api/mcc/setup/apply", methods=["POST"])
+    def mcc_setup_apply():
+        """Execute an explicitly approved setup action (local adopt only)."""
+        body = request.get_json(silent=True) or {}
+        action = (body.get("action") or "").strip()
+        confirm = bool(body.get("confirm"))
+        if not confirm:
+            return _json_result(False, "confirm=true is required", status=400)
+        if action == "adopt_server":
+            key = body.get("server_key")
+            if not key:
+                return _json_result(False, "server_key is required")
+            if not body.get("is_self", True):
+                return _json_result(
+                    False,
+                    "Adoption is local-only — run Set Up Management on the peer machine.")
+            ok, msg, warnings = ai_manager.adopt_server(key)
+            return _json_result(ok, msg, {"warnings": warnings})
+        if action == "enable_allow_control":
+            mid = body.get("machine_id")
+            if not mid:
+                return _json_result(False, "machine_id is required")
+            ok, msg = fleet_manager.set_control(mid, True)
+            return _json_result(ok, msg)
+        return _json_result(False, f"unsupported setup action {action!r}")
 
     @app.route("/api/mcc/profiles", methods=["GET"])
     def mcc_profiles_list():
@@ -358,6 +640,13 @@ def create_app(sampler: SystemSampler | None = None,
     def mcc_profiles_save():
         body = request.get_json(silent=True) or {}
         ok, msg, profile = profile_store.save(body)
+        return _json_result(ok, msg, profile)
+
+    @app.route("/api/mcc/profiles/<profile_id>", methods=["PATCH"])
+    def mcc_profiles_patch(profile_id):
+        """Patch user-facing fields (friendly name, tags, protected, notes…)."""
+        body = request.get_json(silent=True) or {}
+        ok, msg, profile = profile_store.patch_user_fields(profile_id, body)
         return _json_result(ok, msg, profile)
 
     @app.route("/api/mcc/profiles/<profile_id>", methods=["DELETE"])
