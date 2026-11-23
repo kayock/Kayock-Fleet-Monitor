@@ -1,0 +1,68 @@
+# Changelog
+
+All notable changes to Kayock Fleet Monitor are documented in this file.
+
+## [v3.2.2] — 2026-11-23
+
+Stable Model Control Center release: fleet-wide server registration, accurate
+management eligibility, persistent model profiles, and documented separation of
+model management from inference-server process control.
+
+### Added
+
+- **Configure Fleet Management** wizard — discover servers across the fleet,
+  preview readiness, select eligible servers, and register them with explicit
+  confirmation
+- **Server-level registration** — register each inference server once; associated
+  model cards inherit management capabilities
+- **Remote adoption** — register peers through the existing `allow_control`
+  proxy (`/api/ai/.../adopt`) without a separate remote-execution stack
+- **Management summary** — servers discovered/registered/needing setup vs
+  models discovered/manageable/needing setup
+- **Needs Setup** filter and server-oriented setup entry points on model cards
+- **Profile inventory sync** — non-destructive create/update with stable
+  multi-machine identities; offline profiles preserved
+- Friendly names, tags, notes, protected-model confirmations, and unverified
+  application-association labels
+- Settings apply modes: Save Profile, Apply Supported Changes, Apply With Restart
+  (known startup flags only; unknown launch args preserved)
+- Corrected resource labels (model RAM vs server RSS vs machine memory/GPU)
+
+### Changed
+
+- Management eligibility prefers registration state before remote-control messaging
+- New registrations leave `exe` blank so discovery noise cannot grant process control
+- Dashboard static assets are cache-busted by app version; index uses `no-store`
+- Documentation clarifies single-machine, multi-machine, and mixed OS fleets
+
+### Safety / non-goals
+
+- Registration does **not** start, stop, restart, load, unload, or download models
+- Remote control remains opt-in per fleet machine
+- No authentication gates added
+- Request preferences are not silently applied to unrelated applications
+
+### Known limitations
+
+- llama-server has no unload-while-running; restart-based switching requires
+  configured process control (executable path)
+- vLLM / SGLang / generic OpenAI endpoints remain monitoring-focused for model
+  management
+- Apply With Restart that rewrites startup args applies on the machine that owns
+  `ai_servers.json` (not proxied as a silent remote config rewrite)
+- Peer Fleet Monitor instances must expose the adopt API for remote registration
+
+## [v3.2.1] — 2026-11-22
+
+Profile sync hardening, legacy profile merge, and UI cache-busting for the
+Model Control Center.
+
+## [v3.2.0] — 2026-11-22
+
+Initial Model Control Center: fleet inventory cards, Simple/Advanced/Expert
+modes, profile storage, settings preview, and remote load/unload when allowed.
+
+## Earlier
+
+See Git history for v3.0.x / v3.1.x system monitoring, AI discovery, and fleet
+features.

@@ -82,26 +82,46 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 
 ### Model Control Center (v3.2.2)
 
-Fleet-wide model cards with Simple / Advanced / Expert modes, remote
-load/unload (when `allow_control` is enabled), profiles, and pending-vs-active
-settings previews — without silently rewriting launch arguments.
+Open the **Model Control** tab for fleet-wide model inventory and management
+across one machine or many (Windows, Linux, or mixed fleets).
 
-- Docs: [`docs/MODEL_CONTROL_CENTER.md`](docs/MODEL_CONTROL_CENTER.md)
-- Open the **Model Control** tab after upgrading to 3.2.2+
-- Use **Configure Fleet Management** to register each inference server once
-- Use **Sync Model Profiles** for automatic per-installation profiles (non-destructive)
-- See [docs/MODEL_CONTROL_CENTER.md](docs/MODEL_CONTROL_CENTER.md) for Apply / Setup / Protected behavior
+| Capability | What it does |
+| --- | --- |
+| Fleet inventory | Discovers inference servers and model installations on every connected machine |
+| Configure Fleet Management | Registers each eligible server **once**; all of its models inherit capabilities |
+| Load / Unload | Runtime model load/unload where the backend supports it (e.g. Ollama, LM Studio, Lemonade) |
+| Server registration | Writes Fleet Monitor management config only — does **not** start, stop, load, or unload anything by itself |
+| Remote management | Proxied actions require explicit **Allow remote control** on that peer (off by default) |
+| Simple / Advanced / Expert | Progressive disclosure of settings and technical details |
+| Model profiles | Persistent per-installation profiles with sync, friendly names, tags, and notes |
+| Profile sync | Non-destructive create/update of inventory metadata; never deletes offline profiles |
+| Application associations | Optional links (unverified suggestions stay labeled until confirmed) |
+| Protected models | Extra confirmation before disruptive actions |
+| Parameter management | Active vs configured vs pending vs request preferences; Apply Supported / Apply With Restart |
+| Resource monitoring | Distinguishes model RAM, server RSS, disk size, and machine-level memory/GPU |
+
+**Model management** (load/unload via backend API) is separate from **process
+management** (start/stop/restart of an inference server). Registration does not
+grant process control; that still requires an explicit executable path in
+Configure.
+
+Backend notes:
+
+- **Ollama / LM Studio / Lemonade** — runtime Load/Unload when registered and authorized
+- **llama-server** — no unload-while-running; model switch uses managed restart only when process control is configured
+- **vLLM / SGLang / generic OpenAI** — monitoring-focused; no fake load/unload
+
+Full detail: [`docs/MODEL_CONTROL_CENTER.md`](docs/MODEL_CONTROL_CENTER.md).
 
 ### FOXAI AI Lab (companion app on port 3010)
 
-Fleet Monitor inventories AI servers; **AI Lab** is a separate Station service
+Fleet Monitor inventories AI servers; **AI Lab** is a separate companion service
 for Direct Chat, Compare Models, and QR tooling against those endpoints.
 
 - Source in this repository: [`ai-lab/`](ai-lab/)
 - Operator docs: [`docs/AI_LAB.md`](docs/AI_LAB.md)
-- Default URL: `http://10.0.0.202:3010/` (Compare: `/#compare`)
-- Runtime stays independent (`foxai-ai-lab.service`); it reads Fleet
-  Monitor `/metrics` and never auto-loads models.
+- Default local URL: `http://127.0.0.1:3010/` (Compare: `/#compare`)
+- Runtime stays independent; it reads Fleet Monitor `/metrics` and never auto-loads models.
 
 ## What the dashboard shows
 
@@ -176,7 +196,7 @@ Full install/update instructions: [docs/INSTALL.md](docs/INSTALL.md).
 ./.venv/bin/python -m pytest tests -v
 ```
 
-**150+ tests** (no hardware or AI servers required) covering: delta math and
+**180+ tests** (no hardware or AI servers required) covering: delta math and
 bounded history, the no-resampling guarantee, GPU compose-branch regression +
 Get-Counter fallback, **Linux collectors** (nvidia power parsing, Intel sysfs
 discovery, intel_gpu_top JSON parsing, explicit unavailable states), **AI
@@ -185,7 +205,9 @@ AI probing/status machine/discovery/config/controls with injected fakes
 (busy-guard, no-mismatched-kill), **three-machine fleet simulation over real
 HTTP**, **real-UDP LAN discovery** (two live listeners), remote-control
 safety (refusal before any network activity, whitelisting), fleet
-config/polling/last-known-good, offline assets and HTML↔JS id agreement.
+config/polling/last-known-good, **Model Control Center** (profiles, sync,
+server registration, fleet-setup wizard, settings classification), offline
+assets and HTML↔JS id agreement.
 
 ## Files
 
@@ -204,6 +226,7 @@ Kayock Fleet Monitor/
 ├── ai-lab/               FOXAI AI Lab Command Center (port 3010 companion)
 ├── docs/AI_LAB.md        AI Lab install, discovery, chat, compare, QR
 ├── docs/MODEL_CONTROL_CENTER.md  MCC modes, load/unload, profiles, safety
+├── CHANGELOG.md          version history (v3.2.2+)
 ├── tests/                automated pytest suite
 ├── docs/INSTALL.md        portable install + update guide
 ├── docs/INTEL_GPU.md      Intel util permission options
@@ -242,6 +265,12 @@ Kayock Fleet Monitor/
   (start/stop/restart/load/unload/adopt/discovery-refresh); peer
   configuration, logs and model pickers stay on the peer. UDP discovery is
   monitor-only by design.
+* **MCC registration vs process control** — Configure Fleet Management
+  registers servers for model-oriented controls; start/stop/restart still
+  need a verified local executable configured by the operator.
+* **Request preferences** — temperature / max tokens saved in profiles are
+  per-request hints for clients that opt in; they do not rewrite every
+  application that uses the model.
 * **Model identification** — llama.cpp servers built without `/props`/`/v1`
   still report via `/health`; a healthy llama-server whose model cannot be
   identified shows `ready: unknown` rather than a guessed name.
