@@ -279,12 +279,7 @@ def create_app(sampler: SystemSampler | None = None,
             if c.get("server_id") and c["server_id"] in ops:
                 c["ops"] = ops[c["server_id"]]
 
-        fleet_snap = fleet_manager.snapshot()
         machines = fleet_manager.list_machines()
-        by_id = {m.get("id"): m for m in machines}
-        for mid, st in (fleet_snap.get("machines") or {}).items():
-            # snapshot shape may nest differently — also try list form
-            pass
         # Prefer detail caches via list + detail()
         for m in machines:
             mid = m.get("id")
