@@ -46,7 +46,7 @@ _werkzeug_log = logging.getLogger("werkzeug")
 _werkzeug_log.setLevel(logging.WARNING)  # avoid a log line every 2 s poll
 
 APP_NAME = "Kayock Fleet Monitor"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 
 
 def _json_result(ok, message, data=None, status=200):
@@ -1026,10 +1026,15 @@ def create_app(sampler: SystemSampler | None = None,
 
     @app.route("/api/diagnostics/record/<record_id>", methods=["GET"])
     def diagnostics_record(record_id):
-        for r in diag_store.list(limit=diag_store.maxlen):
-            if r.get("id") == record_id:
-                return jsonify({"ok": True, "data": r})
-        return _json_result(False, "record not found", status=404)
+        soft = request.args.get("soft", "1") not in ("0", "false", "no")
+        rec, meta = diag_store.get(record_id, soft=soft)
+        if rec:
+            return jsonify({"ok": True, "data": rec, "lookup": meta})
+        return jsonify({
+            "ok": False,
+            "message": "record not found",
+            "lookup": meta,
+        }), 404
 
     return app
 

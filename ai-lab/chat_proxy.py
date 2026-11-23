@@ -21,6 +21,57 @@ from urllib.parse import urlparse
 # Default: Station-local Fleet Monitor diagnostics ingest (no auth).
 _DEFAULT_DIAG_URL = "http://127.0.0.1:5000/api/diagnostics/ingest"
 
+# Timeout defaults (seconds). Non-stream total keeps the historical 90s default;
+# streaming uses inactivity between chunks instead of a short hard total.
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_FIRST_TOKEN_TIMEOUT = 90.0
+DEFAULT_READ_INACTIVITY_TIMEOUT = 120.0
+DEFAULT_NONSTREAM_TOTAL_TIMEOUT = 90.0  # historical Direct Chat / compare value
+
+
+def _env_float(name: str, default: float | None) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    if str(raw).strip().lower() in ("none", "null", "off", "0"):
+        return None if name.endswith("TOTAL_TIMEOUT") else default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else default
+
+
+def resolve_timeouts(overrides: dict | None = None) -> dict:
+    """Merge env defaults with optional per-request overrides.
+
+    Keys: connect, first_token, read_inactivity, total
+    total=None means no overall wall-clock limit (streaming).
+    """
+    overrides = overrides or {}
+    cfg = {
+        "connect": _env_float("AI_LAB_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT),
+        "first_token": _env_float(
+            "AI_LAB_FIRST_TOKEN_TIMEOUT", DEFAULT_FIRST_TOKEN_TIMEOUT),
+        "read_inactivity": _env_float(
+            "AI_LAB_READ_INACTIVITY_TIMEOUT", DEFAULT_READ_INACTIVITY_TIMEOUT),
+        "total": _env_float("AI_LAB_TOTAL_TIMEOUT", None),
+        "nonstream_total": _env_float(
+            "AI_LAB_NONSTREAM_TOTAL_TIMEOUT", DEFAULT_NONSTREAM_TOTAL_TIMEOUT),
+    }
+    for key in ("connect", "first_token", "read_inactivity", "total",
+                "nonstream_total"):
+        if key in overrides and overrides[key] is not None:
+            try:
+                val = float(overrides[key])
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                cfg[key] = val
+        elif key in overrides and overrides[key] is None and key == "total":
+            cfg[key] = None
+    return cfg
+
 
 def _request(method: str, url: str, payload: dict | None = None,
              timeout: float = 60.0, stream: bool = False):
@@ -30,6 +81,36 @@ def _request(method: str, url: str, payload: dict | None = None,
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _urlopen_request(req: urllib.request.Request, *, connect_timeout: float):
+    """Open HTTP request; connect_timeout also seeds the initial socket timeout."""
+    return urllib.request.urlopen(req, timeout=connect_timeout)
+
+
+def _set_socket_timeout(resp, seconds: float | None) -> None:
+    if seconds is None:
+        return
+    try:
+        resp.fp.raw._sock.settimeout(float(seconds))  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            resp.fp._sock.settimeout(float(seconds))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _classify_transport_timeout(*, saw_data: bool, timed_out: bool,
+                                connection_error: bool) -> str | None:
+    if connection_error and not saw_data:
+        return "connection"
+    if timed_out and not saw_data:
+        return "first_token"
+    if timed_out and saw_data:
+        return "stream_inactivity"
+    if timed_out:
+        return "total"
+    return None
 
 
 def _engine_family(engine: str) -> str:
@@ -71,7 +152,8 @@ def normalize_max_tokens(value: Any) -> tuple[int | None, str | None]:
 
 
 def _request_meta(*, max_tokens: int | None, think: str | None,
-                  stream: bool, family: str) -> dict:
+                  stream: bool, family: str,
+                  timeouts: dict | None = None) -> dict:
     mode = "custom" if max_tokens is not None else "model_default"
     meta: dict[str, Any] = {
         "max_tokens": max_tokens,
@@ -81,6 +163,12 @@ def _request_meta(*, max_tokens: int | None, think: str | None,
     }
     if family == "ollama" and max_tokens is not None:
         meta["num_predict"] = int(max_tokens)
+    if timeouts:
+        meta["timeouts"] = {
+            k: timeouts.get(k) for k in (
+                "connect", "first_token", "read_inactivity", "total",
+                "nonstream_total")
+        }
     return meta
 
 
@@ -123,9 +211,11 @@ def _emit_diagnostic(result: dict, *, client: str = "foxai-ai-lab") -> None:
         "finish_reason": result.get("finish_reason"),
         "error": result.get("error"),
         "timed_out": bool(result.get("timed_out")),
+        "timeout_kind": result.get("timeout_kind"),
         "connection_error": bool(result.get("connection_error")),
         "cancelled": bool(result.get("cancelled")),
         "stream_complete": result.get("stream_complete"),
+        "partial": bool(result.get("partial")),
         "prompt_eval_duration_ns": result.get("prompt_eval_duration_ns"),
         "eval_duration_ns": result.get("eval_duration_ns"),
         "request": req_meta,
@@ -253,21 +343,29 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
                     messages: list[dict], stream: bool = True,
                     think: str | None = "auto",
                     max_tokens: int | None = None,
-                    require_loaded: bool = True) -> dict:
+                    require_loaded: bool = True,
+                    timeouts: dict | None = None) -> dict:
     """Non-streaming convenience wrapper used by compare + simple chat.
 
     max_tokens=None means model/client default — do not send an explicit
     num_predict / max_tokens cap.
+
+    Non-stream uses an explicit total timeout (default 90s, configurable).
+    Prefer streaming for slow models so inactivity timeouts apply between chunks.
     """
     base = endpoint.rstrip("/")
     family = _engine_family(engine)
     started = time.time()
     request_id = uuid.uuid4().hex
+    tcfg = resolve_timeouts(timeouts)
+    total_timeout = tcfg.get("nonstream_total") or tcfg.get("total") or DEFAULT_NONSTREAM_TOTAL_TIMEOUT
+    connect_timeout = tcfg.get("connect") or DEFAULT_CONNECT_TIMEOUT
     max_tokens, mt_err = normalize_max_tokens(max_tokens)
     if mt_err:
         return {"ok": False, "error": mt_err, "request_id": request_id,
                 "elapsed_ms": 0, "request": _request_meta(
-                    max_tokens=None, think=think, stream=False, family=family)}
+                    max_tokens=None, think=think, stream=False, family=family,
+                    timeouts=tcfg)}
 
     def fail_early(error: str) -> dict:
         result = {
@@ -277,7 +375,8 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
             "model": model, "engine": engine, "endpoint": base,
             "request_id": request_id,
             "request": _request_meta(
-                max_tokens=max_tokens, think=think, stream=False, family=family),
+                max_tokens=max_tokens, think=think, stream=False, family=family,
+                timeouts=tcfg),
         }
         _emit_diagnostic(result, client="foxai-ai-lab")
         return result
@@ -299,6 +398,10 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
                 f"Model {model!r} is not available on this endpoint. "
                 "AI Lab will not substitute another model.")
 
+    # urllib uses one socket timeout for connect+read; for non-stream that is
+    # the configured total wall-clock budget (historical default: 90s).
+    open_timeout = float(total_timeout)
+
     try:
         if family == "ollama" or (family == "auto" and "ollama" in (engine or "").lower()):
             payload: dict[str, Any] = {
@@ -312,7 +415,7 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
             if think_v is not None:
                 payload["think"] = think_v
             with _request("POST", f"{base}/api/chat", payload=payload,
-                          timeout=90) as resp:
+                          timeout=open_timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8", "replace"))
             msg = body.get("message") or {}
             content = msg.get("content") or ""
@@ -340,7 +443,7 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
                 "request_id": request_id,
                 "request": _request_meta(
                     max_tokens=max_tokens, think=think, stream=False,
-                    family="ollama"),
+                    family="ollama", timeouts=tcfg),
                 "endpoint": base,
                 "stream_complete": True,
             }
@@ -356,7 +459,7 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
         with _request("POST", f"{base}/v1/chat/completions", payload=payload,
-                      timeout=90) as resp:
+                      timeout=open_timeout) as resp:
             body = json.loads(resp.read().decode("utf-8", "replace"))
         choice = (body.get("choices") or [{}])[0]
         message = choice.get("message") or {}
@@ -379,7 +482,7 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
             "request_id": request_id,
             "request": _request_meta(
                 max_tokens=max_tokens, think=None, stream=False,
-                family="openai"),
+                family="openai", timeouts=tcfg),
             "endpoint": base,
             "stream_complete": True,
         }
@@ -396,20 +499,25 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
                   "request_id": request_id,
                   "request": _request_meta(
                       max_tokens=max_tokens, think=think, stream=False,
-                      family=family)}
+                      family=family, timeouts=tcfg)}
         _emit_diagnostic(result, client="foxai-ai-lab")
         return result
     except Exception as exc:
         timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
         conn = "connection" in str(exc).lower() or "refused" in str(exc).lower()
+        kind = None
+        if timed_out:
+            # Non-stream: socket timeout covers connect+full body read → total
+            kind = "connection" if (conn and (time.time() - started) < (connect_timeout + 1)) else "total"
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
                   "elapsed_ms": round((time.time() - started) * 1000, 1),
                   "model": model, "engine": engine, "endpoint": base,
-                  "timed_out": timed_out, "connection_error": conn,
+                  "timed_out": timed_out, "timeout_kind": kind,
+                  "connection_error": conn,
                   "request_id": request_id,
                   "request": _request_meta(
                       max_tokens=max_tokens, think=think, stream=False,
-                      family=family)}
+                      family=family, timeouts=tcfg)}
         _emit_diagnostic(result, client="foxai-ai-lab")
         return result
 
@@ -417,10 +525,16 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
 def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],
                        think: str | None = "auto",
                        max_tokens: int | None = None,
-                       engine: str = "ollama") -> Iterator[bytes]:
-    """Stream Ollama NDJSON; emit exactly one diagnostic record when finished."""
+                       engine: str = "ollama",
+                       timeouts: dict | None = None) -> Iterator[bytes]:
+    """Stream Ollama NDJSON; emit exactly one diagnostic record when finished.
+
+    Socket timeout starts as first_token, then switches to read_inactivity after
+    the first chunk so slow-but-active generation is not killed by a short total.
+    """
     base = endpoint.rstrip("/")
     max_tokens, mt_err = normalize_max_tokens(max_tokens)
+    tcfg = resolve_timeouts(timeouts)
     request_id = uuid.uuid4().hex
     started = time.time()
     emitted = False
@@ -429,7 +543,10 @@ def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],
     cancelled = False
     timed_out = False
     connection_error = False
+    timeout_kind: str | None = None
+    saw_data = False
     error: str | None = mt_err
+    partial_content = ""
 
     payload: dict[str, Any] = {
         "model": model,
@@ -469,12 +586,32 @@ def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],
             "stream_complete": stream_complete,
             "cancelled": cancelled,
             "timed_out": timed_out,
+            "timeout_kind": timeout_kind,
             "connection_error": connection_error,
+            "partial": bool(partial_content) and not stream_complete,
             "request": _request_meta(
                 max_tokens=max_tokens, think=think, stream=True,
-                family="ollama"),
+                family="ollama", timeouts=tcfg),
         }
         _emit_diagnostic(result, client="foxai-ai-lab")
+        # Expose diagnostic ids to stream consumers via trailing meta line
+        if result.get("diagnostic_id"):
+            meta = {
+                "ok": result["ok"],
+                "type": "diagnostic_meta",
+                "diagnostic_id": result.get("diagnostic_id"),
+                "diagnostic_url": result.get("diagnostic_url"),
+                "stop_reason": result.get("stop_reason"),
+                "timeout_kind": timeout_kind,
+                "request_id": request_id,
+                "elapsed_ms": result.get("elapsed_ms"),
+                "completion_tokens": eval_count,
+                "done_reason": last.get("done_reason"),
+                "partial": result.get("partial"),
+                "error": error,
+            }
+            # Store for optional yield after finalize from caller — attached on result
+            stream_ollama_chat._last_meta = meta  # type: ignore[attr-defined]
 
     if mt_err:
         finalize()
@@ -488,20 +625,36 @@ def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        first_to = float(tcfg.get("first_token") or DEFAULT_FIRST_TOKEN_TIMEOUT)
+        inactivity = float(tcfg.get("read_inactivity") or DEFAULT_READ_INACTIVITY_TIMEOUT)
+        connect_to = float(tcfg.get("connect") or DEFAULT_CONNECT_TIMEOUT)
+        total_to = tcfg.get("total")
+        with _urlopen_request(req, connect_timeout=min(connect_to, first_to)) as resp:
+            _set_socket_timeout(resp, first_to)
             for line in resp:
-                yield line
+                if total_to and (time.time() - started) > float(total_to):
+                    timed_out = True
+                    timeout_kind = "total"
+                    error = f"TimeoutError: total request timeout ({total_to}s)"
+                    break
+                if not saw_data:
+                    _set_socket_timeout(resp, inactivity)
+                # Parse before yield so cancel/timeout mid-stream still sees partials
                 try:
                     text = line.decode("utf-8", "replace").strip()
-                    if not text:
-                        continue
-                    chunk = json.loads(text)
-                    if isinstance(chunk, dict):
-                        last = chunk
-                        if chunk.get("done") is True:
-                            stream_complete = True
+                    if text:
+                        chunk = json.loads(text)
+                        if isinstance(chunk, dict):
+                            saw_data = True
+                            last = chunk
+                            msg = chunk.get("message") or {}
+                            if msg.get("content"):
+                                partial_content += str(msg.get("content") or "")
+                            if chunk.get("done") is True:
+                                stream_complete = True
                 except (ValueError, UnicodeError):
                     pass
+                yield line
     except GeneratorExit:
         cancelled = True
         finalize()
@@ -509,18 +662,32 @@ def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],
     except Exception as exc:
         timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
         connection_error = "connection" in str(exc).lower() or "refused" in str(exc).lower()
+        if timed_out and not timeout_kind:
+            timeout_kind = _classify_transport_timeout(
+                saw_data=saw_data, timed_out=True,
+                connection_error=connection_error)
         error = f"{type(exc).__name__}: {exc}"
-        yield (json.dumps({"ok": False, "error": error}) + "\n").encode()
+        yield (json.dumps({
+            "ok": False, "error": error, "timeout_kind": timeout_kind,
+            "timed_out": timed_out, "partial": bool(partial_content),
+            "message": partial_content or None,
+        }) + "\n").encode()
     finally:
         finalize()
+        meta = None if cancelled else getattr(stream_ollama_chat, "_last_meta", None)
+        stream_ollama_chat._last_meta = None  # type: ignore[attr-defined]
+    if meta:
+        yield (json.dumps(meta) + "\n").encode()
 
 
 def stream_openai_chat(*, endpoint: str, model: str, messages: list[dict],
                        max_tokens: int | None = None,
-                       engine: str = "openai-compatible") -> Iterator[bytes]:
+                       engine: str = "openai-compatible",
+                       timeouts: dict | None = None) -> Iterator[bytes]:
     """Stream OpenAI SSE; emit exactly one diagnostic record when finished."""
     base = endpoint.rstrip("/")
     max_tokens, mt_err = normalize_max_tokens(max_tokens)
+    tcfg = resolve_timeouts(timeouts)
     request_id = uuid.uuid4().hex
     started = time.time()
     emitted = False
@@ -530,8 +697,10 @@ def stream_openai_chat(*, endpoint: str, model: str, messages: list[dict],
     cancelled = False
     timed_out = False
     connection_error = False
+    timeout_kind: str | None = None
     error: str | None = mt_err
     saw_chunk = False
+    partial_content = ""
 
     payload: dict[str, Any] = {
         "model": model,
@@ -564,14 +733,31 @@ def stream_openai_chat(*, endpoint: str, model: str, messages: list[dict],
             "stream_complete": stream_complete or bool(finish_reason),
             "cancelled": cancelled,
             "timed_out": timed_out,
+            "timeout_kind": timeout_kind,
             "connection_error": connection_error,
+            "partial": bool(partial_content) and not (stream_complete or finish_reason),
             "request": _request_meta(
                 max_tokens=max_tokens, think=None, stream=True,
-                family="openai"),
+                family="openai", timeouts=tcfg),
         }
         if saw_chunk and finish_reason is None and error is None and not cancelled:
             result["stream_complete"] = False
         _emit_diagnostic(result, client="foxai-ai-lab")
+        if result.get("diagnostic_id"):
+            stream_openai_chat._last_meta = {  # type: ignore[attr-defined]
+                "ok": result["ok"],
+                "type": "diagnostic_meta",
+                "diagnostic_id": result.get("diagnostic_id"),
+                "diagnostic_url": result.get("diagnostic_url"),
+                "stop_reason": result.get("stop_reason"),
+                "timeout_kind": timeout_kind,
+                "request_id": request_id,
+                "elapsed_ms": result.get("elapsed_ms"),
+                "completion_tokens": comp,
+                "finish_reason": finish_reason,
+                "partial": result.get("partial"),
+                "error": error,
+            }
 
     if mt_err:
         finalize()
@@ -585,29 +771,43 @@ def stream_openai_chat(*, endpoint: str, model: str, messages: list[dict],
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        first_to = float(tcfg.get("first_token") or DEFAULT_FIRST_TOKEN_TIMEOUT)
+        inactivity = float(tcfg.get("read_inactivity") or DEFAULT_READ_INACTIVITY_TIMEOUT)
+        connect_to = float(tcfg.get("connect") or DEFAULT_CONNECT_TIMEOUT)
+        total_to = tcfg.get("total")
+        with _urlopen_request(req, connect_timeout=min(connect_to, first_to)) as resp:
+            _set_socket_timeout(resp, first_to)
             for line in resp:
-                yield line
+                if total_to and (time.time() - started) > float(total_to):
+                    timed_out = True
+                    timeout_kind = "total"
+                    error = f"TimeoutError: total request timeout ({total_to}s)"
+                    break
+                if not saw_chunk:
+                    _set_socket_timeout(resp, inactivity)
                 try:
                     text = line.decode("utf-8", "replace").strip()
-                    if not text.startswith("data:"):
-                        continue
-                    data = text[5:].strip()
-                    if data == "[DONE]":
-                        stream_complete = True
-                        continue
-                    chunk = json.loads(data)
-                    saw_chunk = True
-                    if isinstance(chunk.get("usage"), dict):
-                        usage = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if choices:
-                        fr = choices[0].get("finish_reason")
-                        if fr:
-                            finish_reason = fr
+                    if text.startswith("data:"):
+                        data = text[5:].strip()
+                        if data == "[DONE]":
                             stream_complete = True
+                        else:
+                            chunk = json.loads(data)
+                            saw_chunk = True
+                            if isinstance(chunk.get("usage"), dict):
+                                usage = chunk["usage"]
+                            choices = chunk.get("choices") or []
+                            if choices:
+                                delta = choices[0].get("delta") or {}
+                                if delta.get("content"):
+                                    partial_content += str(delta.get("content") or "")
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+                                    stream_complete = True
                 except (ValueError, UnicodeError, IndexError, TypeError):
                     pass
+                yield line
     except GeneratorExit:
         cancelled = True
         finalize()
@@ -615,7 +815,19 @@ def stream_openai_chat(*, endpoint: str, model: str, messages: list[dict],
     except Exception as exc:
         timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
         connection_error = "connection" in str(exc).lower() or "refused" in str(exc).lower()
+        if timed_out and not timeout_kind:
+            timeout_kind = _classify_transport_timeout(
+                saw_data=saw_chunk, timed_out=True,
+                connection_error=connection_error)
         error = f"{type(exc).__name__}: {exc}"
-        yield (json.dumps({"ok": False, "error": error}) + "\n").encode()
+        yield (json.dumps({
+            "ok": False, "error": error, "timeout_kind": timeout_kind,
+            "timed_out": timed_out, "partial": bool(partial_content),
+            "message": partial_content or None,
+        }) + "\n").encode()
     finally:
         finalize()
+        meta = None if cancelled else getattr(stream_openai_chat, "_last_meta", None)
+        stream_openai_chat._last_meta = None  # type: ignore[attr-defined]
+    if meta:
+        yield (json.dumps(meta) + "\n").encode()

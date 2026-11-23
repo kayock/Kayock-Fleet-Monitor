@@ -662,6 +662,15 @@ STOP_REASONS = {
 }
 
 
+_TIMEOUT_KIND_LABELS = {
+    "connection": "connection timeout (TCP/HTTP establish)",
+    "first_token": "first-token timeout (no stream data yet)",
+    "stream_inactivity": "stream inactivity timeout (stall between chunks)",
+    "total": "total request timeout (wall-clock)",
+    "nonstream_total": "non-stream total timeout (wall-clock)",
+}
+
+
 def classify_stop_reason(*, ok: bool | None = None,
                          done_reason: str | None = None,
                          finish_reason: str | None = None,
@@ -671,15 +680,27 @@ def classify_stop_reason(*, ok: bool | None = None,
                          cancelled: bool = False,
                          completion_tokens: int | None = None,
                          max_output: int | None = None,
-                         stream_complete: bool | None = None) -> dict:
+                         stream_complete: bool | None = None,
+                         timeout_kind: str | None = None,
+                         partial: bool = False) -> dict:
     evidence = []
     code = "unknown"
+    kind = (timeout_kind or "").strip().lower() or None
     if cancelled:
         code = "streaming_interrupted"
         evidence.append("Client cancelled or disconnected before completion")
-    elif timed_out:
+        if partial:
+            evidence.append("Partial response text was produced before cancel")
+    elif timed_out or kind:
         code = "request_timed_out"
-        evidence.append("Client or transport timeout flagged")
+        if kind and kind in _TIMEOUT_KIND_LABELS:
+            evidence.append(f"timeout_kind={kind}: {_TIMEOUT_KIND_LABELS[kind]}")
+        elif kind:
+            evidence.append(f"timeout_kind={kind}")
+        else:
+            evidence.append("Client or transport timeout flagged")
+        if partial:
+            evidence.append("Partial response text was produced before timeout")
     elif connection_error:
         code = "connection_lost"
         evidence.append("Connection error before completion")
@@ -687,6 +708,8 @@ def classify_stop_reason(*, ok: bool | None = None,
         el = error.lower()
         if "timeout" in el or "timed out" in el:
             code = "request_timed_out"
+            if kind and kind in _TIMEOUT_KIND_LABELS:
+                evidence.append(f"timeout_kind={kind}: {_TIMEOUT_KIND_LABELS[kind]}")
         elif "connection" in el or "refused" in el or "reset" in el:
             code = "connection_lost"
         elif "not currently loaded" in el or "not available" in el or "model" in el and "load" in el:
@@ -721,6 +744,8 @@ def classify_stop_reason(*, ok: bool | None = None,
         elif stream_complete is False:
             code = "streaming_interrupted"
             evidence.append("Stream ended without completion marker")
+            if partial:
+                evidence.append("Partial response text was produced")
 
     confidence = "confirmed"
     if code == "unknown":
@@ -730,7 +755,7 @@ def classify_stop_reason(*, ok: bool | None = None,
     elif code == "completed_normally" and not (done_reason or finish_reason):
         confidence = "probable"
 
-    return {
+    out = {
         "code": code,
         "label": STOP_REASONS.get(code, STOP_REASONS["unknown"]),
         "confidence": confidence,
@@ -738,6 +763,10 @@ def classify_stop_reason(*, ok: bool | None = None,
         "raw_done_reason": done_reason,
         "raw_finish_reason": finish_reason,
     }
+    if kind:
+        out["timeout_kind"] = kind
+        out["timeout_kind_label"] = _TIMEOUT_KIND_LABELS.get(kind, kind)
+    return out
 
 
 def detect_config_conflicts(*, inspection: dict,
@@ -853,11 +882,37 @@ def troubleshoot_record(record: dict) -> list[dict]:
             "Compare requested context vs model/server context in the Configuration tab.",
             "confirmed", "error")
     elif code == "request_timed_out":
-        add("The request timed out before completion.",
+        kind = record.get("timeout_kind") or stop.get("timeout_kind")
+        kind_note = ""
+        if kind == "first_token":
+            kind_note = " Generation never started returning tokens (first-token timeout)."
+            cause = ("Model load / prompt eval still running, or the backend never began "
+                     "streaming before the first-token budget elapsed.")
+            nxt = ("Raise AI Lab first-token timeout if prompt eval is legitimately slow; "
+                   "confirm the model is loaded and the host is not saturated.")
+        elif kind == "stream_inactivity":
+            kind_note = " Stream stalled between chunks (inactivity timeout)."
+            cause = ("Token generation stalled, backend hung, or network paused "
+                     "longer than the stream inactivity budget.")
+            nxt = ("Distinguish from slow-but-active streams: inactivity fires only when "
+                   "no chunks arrive. Check GPU/CPU saturation and Ollama health.")
+        elif kind in ("total", "nonstream_total"):
+            kind_note = " Overall wall-clock total timeout elapsed."
+            cause = ("Non-streaming or explicit total budget exhausted before completion. "
+                     "Slow models often need streaming + inactivity timeouts instead.")
+            nxt = ("Prefer streaming Direct Chat for slow local models. Adjust "
+                   "nonstream_total / total only when an overall cap is intentionally required.")
+        elif kind == "connection":
+            kind_note = " Connection could not be established in time."
+            cause = "Endpoint unreachable, refused, or connect budget too short."
+            nxt = "Verify the inference endpoint is reachable on the LAN."
+        else:
+            cause = "Client timeout, overloaded host, or extremely slow generation."
+            nxt = ("Check machine load and tokens/sec history. Prefer streaming with "
+                   "inactivity timeouts for slow local models.")
+        add("The request timed out before completion." + kind_note,
             stop.get("evidence") or [err],
-            "Client timeout, overloaded host, or extremely slow generation.",
-            "Check machine load and tokens/sec history. Avoid long runs while diagnosing.",
-            "confirmed", "error")
+            cause, nxt, "confirmed", "error")
     elif code == "connection_lost":
         add("The connection failed before generation completed.",
             stop.get("evidence") or [err],
@@ -975,6 +1030,8 @@ class DiagnosticStore:
                 max_output=(rec.get("request") or {}).get("max_tokens")
                 or (rec.get("request") or {}).get("max_output"),
                 stream_complete=rec.get("stream_complete"),
+                timeout_kind=rec.get("timeout_kind"),
+                partial=bool(rec.get("partial")),
             )
             rec["stop_reason"] = stop
             rec["findings"] = troubleshoot_record(rec)
@@ -1007,6 +1064,68 @@ class DiagnosticStore:
             if len(out) >= limit:
                 break
         return out
+
+    @staticmethod
+    def _id_distance(a: str, b: str) -> int:
+        """Levenshtein distance for short diagnostic ids (typo soft-match)."""
+        a = (a or "").lower()
+        b = (b or "").lower()
+        if a == b:
+            return 0
+        if not a or not b:
+            return max(len(a), len(b))
+        if abs(len(a) - len(b)) > 2:
+            return 99
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                ins = cur[j - 1] + 1
+                delete = prev[j] + 1
+                sub = prev[j - 1] + (0 if ca == cb else 1)
+                cur.append(min(ins, delete, sub))
+            prev = cur
+        return prev[-1]
+
+    def get(self, record_id: str, *, soft: bool = True,
+            max_distance: int = 2) -> tuple[dict | None, dict]:
+        """Lookup by exact id, then request_id, then soft typo match.
+
+        Returns (record_or_None, meta) where meta describes match quality.
+        Soft match covers transcription typos (e.g. a822… vs a82d…).
+        """
+        want = (record_id or "").strip()
+        meta = {"query": want, "match": None, "distance": None}
+        if not want:
+            return None, meta
+        with _lock:
+            rows = list(self._records)
+        for r in reversed(rows):
+            if r.get("id") == want:
+                meta.update(match="exact_id", distance=0)
+                return deepcopy(r), meta
+        for r in reversed(rows):
+            if r.get("request_id") == want or (
+                    isinstance(r.get("request_id"), str)
+                    and r.get("request_id", "").startswith(want)):
+                meta.update(match="request_id", distance=0)
+                return deepcopy(r), meta
+        if soft and len(want) >= 8:
+            best = None
+            best_d = max_distance + 1
+            for r in reversed(rows):
+                rid = str(r.get("id") or "")
+                if abs(len(rid) - len(want)) > max_distance:
+                    continue
+                d = self._id_distance(want, rid)
+                if d < best_d:
+                    best_d = d
+                    best = r
+            if best is not None and best_d <= max_distance:
+                meta.update(match="soft_id", distance=best_d,
+                            resolved_id=best.get("id"))
+                return deepcopy(best), meta
+        return None, meta
 
     def performance_summary(self, *, model: str | None = None,
                             machine: str | None = None) -> dict:

@@ -48,6 +48,40 @@ def test_classify_stop_reason_timeout():
     assert r["code"] == "request_timed_out"
 
 
+def test_classify_stop_reason_timeout_kind_first_token():
+    r = classify_stop_reason(
+        ok=False, timed_out=True, timeout_kind="first_token", partial=False)
+    assert r["code"] == "request_timed_out"
+    assert r["timeout_kind"] == "first_token"
+    assert any("first-token" in e for e in r["evidence"])
+
+
+def test_classify_stop_reason_timeout_kind_inactivity_partial():
+    r = classify_stop_reason(
+        ok=False, timed_out=True, timeout_kind="stream_inactivity",
+        partial=True)
+    assert r["code"] == "request_timed_out"
+    assert r["timeout_kind"] == "stream_inactivity"
+    assert any("Partial" in e for e in r["evidence"])
+
+
+def test_troubleshoot_distinguishes_timeout_kinds():
+    for kind in ("first_token", "stream_inactivity", "total", "connection"):
+        rec = {
+            "ok": False,
+            "timed_out": True,
+            "timeout_kind": kind,
+            "error": "TimeoutError: timed out",
+            "stop_reason": classify_stop_reason(
+                ok=False, timed_out=True, timeout_kind=kind),
+        }
+        findings = troubleshoot_record(rec)
+        assert findings
+        assert findings[0]["severity"] == "error"
+        blob = " ".join(str(findings[0].get(k) or "") for k in findings[0])
+        assert kind.replace("_", " ") in blob.lower() or kind in blob or findings[0]["likely_cause"]
+
+
 def test_classify_stop_reason_context():
     r = classify_stop_reason(ok=False, error="context length exceeded")
     assert r["code"] == "context_limit_exceeded"
@@ -295,6 +329,9 @@ def test_api_ingest_and_inspect(client, monkeypatch):
 def test_app_version_is_v33():
     from app import APP_VERSION
     assert APP_VERSION.startswith("3.3")
+    # Soft-match + timeout_kind shipping as 3.3.1+
+    parts = APP_VERSION.split(".")
+    assert int(parts[1]) >= 3
 
 
 def test_resolve_remote_loopback_uses_registered_peer_host():

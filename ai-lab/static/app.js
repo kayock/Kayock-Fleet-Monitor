@@ -3,6 +3,8 @@
   const PREF_CHAT_CUSTOM = "ailab.max_tokens.chat.custom";
   const PREF_CMP_MODE = "ailab.max_tokens.compare.mode";
   const PREF_CMP_CUSTOM = "ailab.max_tokens.compare.custom";
+  const PREF_TIMEOUT_FIRST = "ailab.timeout.first_token";
+  const PREF_TIMEOUT_IDLE = "ailab.timeout.read_inactivity";
   const FLEET_MONITOR = "http://10.0.0.202:5000";
 
   const state = {
@@ -10,6 +12,7 @@
     chatHistory: [],
     servers: [],
     compareModels: [], // [{endpoint, engine, model, machine, label, loaded, serverId}]
+    chatAbort: null,
   };
 
   const byId = (id) => document.getElementById(id);
@@ -71,10 +74,18 @@
   function diagWarning(body) {
     const stop = body.stop_reason || {};
     const code = stop.code || "";
+    const kind = body.timeout_kind || "";
     if (code === "output_limit_reached") return "⚠️ Output token limit reached";
     if (code === "streaming_interrupted") return "⚠️ Response stream interrupted";
-    if (code === "request_timed_out") return "⚠️ Request timed out";
+    if (code === "request_timed_out" || body.timed_out) {
+      if (kind === "first_token") return "⚠️ Timed out waiting for first token";
+      if (kind === "stream_inactivity") return "⚠️ Stream stalled (inactivity timeout)";
+      if (kind === "connection") return "⚠️ Connection timed out";
+      if (kind === "total") return "⚠️ Total request timeout";
+      return "⚠️ Request timed out";
+    }
     if (code === "connection_lost") return "⚠️ Connection lost";
+    if (body.partial) return "⚠️ Incomplete response (partial text preserved)";
     if (code === "unknown" && body.error) return "Completion reason unavailable";
     if (body.done_reason === "length" || body.finish_reason === "length") {
       return "⚠️ Output token limit reached";
@@ -82,9 +93,44 @@
     return "";
   }
 
+  function readTimeoutOverrides() {
+    const out = {};
+    const first = byId("chat-timeout-first");
+    const idle = byId("chat-timeout-idle");
+    if (first && first.value) {
+      const n = Number(first.value);
+      if (Number.isFinite(n) && n > 0) out.first_token = n;
+    }
+    if (idle && idle.value) {
+      const n = Number(idle.value);
+      if (Number.isFinite(n) && n > 0) out.read_inactivity = n;
+    }
+    return out;
+  }
+
+  function bindTimeoutPrefs() {
+    const first = byId("chat-timeout-first");
+    const idle = byId("chat-timeout-idle");
+    if (first) {
+      first.value = loadPref(PREF_TIMEOUT_FIRST, "") || "";
+      first.addEventListener("change", () => savePref(PREF_TIMEOUT_FIRST, first.value || ""));
+    }
+    if (idle) {
+      idle.value = loadPref(PREF_TIMEOUT_IDLE, "") || "";
+      idle.addEventListener("change", () => savePref(PREF_TIMEOUT_IDLE, idle.value || ""));
+    }
+  }
+
   function diagSummaryHtml(body, modelLabel, outputLimitLabel) {
     const stop = body.stop_reason || {};
+    const kind = body.timeout_kind || "";
+    const kindLabel = kind
+      ? ({ first_token: "first-token timeout", stream_inactivity: "stream inactivity",
+           connection: "connection timeout", total: "total request timeout",
+           nonstream_total: "non-stream total timeout" }[kind] || kind)
+      : "";
     const stopLabel = stop.label
+      || (body.timed_out && kindLabel ? `Request Timed Out (${kindLabel})` : "")
       || body.done_reason
       || body.finish_reason
       || (body.ok ? "Completion reason unavailable" : (body.error || "error"));
@@ -105,10 +151,29 @@
       <div><b>Output limit:</b> ${esc(limitShown)}</div>
       <div><b>Generated:</b> ${esc(gen)} <span title="Backend-reported completion tokens; not character length">(backend tokens)</span></div>
       <div><b>Stop reason:</b> ${esc(stopLabel)}${stop.confidence ? ` (${esc(stop.confidence)})` : ""}</div>
+      ${kind ? `<div><b>Timeout kind:</b> ${esc(kindLabel)}</div>` : ""}
+      ${body.partial ? `<div><b>Partial:</b> yes — incomplete text preserved</div>` : ""}
       <div><b>Speed:</b> ${esc(speed)} · <b>Duration:</b> ${esc(dur)}</div>
       ${warn ? `<div class="diag-warn">${esc(warn)}</div>` : ""}
       ${link ? `<div>${link}</div>` : ""}
     </div>`;
+  }
+
+  function setChatBusy(busy) {
+    const form = byId("chat-form");
+    const cancel = byId("chat-cancel");
+    if (form) {
+      const btn = form.querySelector('button[type="submit"]');
+      if (btn) btn.disabled = !!busy;
+    }
+    if (cancel) cancel.hidden = !busy;
+  }
+
+  function cancelDirectChat() {
+    if (state.chatAbort) {
+      state.chatAbort.abort();
+      state.chatAbort = null;
+    }
   }
 
   function fmtBytes(n) {
@@ -314,13 +379,21 @@
 
   byId("chat-server").addEventListener("change", loadModelsForServer);
   byId("chat-clear").addEventListener("click", () => {
+    if (state.chatAbort) cancelDirectChat();
     state.chatHistory = [];
     renderChat();
     byId("chat-stats").textContent = "";
+    byId("chat-meta").textContent = "";
   });
+  const chatCancelBtn = byId("chat-cancel");
+  if (chatCancelBtn) chatCancelBtn.addEventListener("click", cancelDirectChat);
 
   byId("chat-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    if (state.chatAbort) {
+      byId("chat-stats").textContent = "A chat request is already in progress.";
+      return;
+    }
     const id = byId("chat-server").value;
     const s = state.servers.find((x) => x.id === id);
     const model = byId("chat-model").value;
@@ -340,65 +413,239 @@
       byId("chat-stats").textContent = mt.error;
       return;
     }
+    const timeouts = readTimeoutOverrides();
     state.chatHistory.push({ role: "user", content: text });
     byId("chat-input").value = "";
+    const assistantIdx = state.chatHistory.length;
+    state.chatHistory.push({ role: "assistant", content: "", thinking: "" });
     renderChat();
-    byId("chat-stats").textContent = "Waiting for response…";
+    byId("chat-stats").textContent = "Waiting for first token…";
+    byId("chat-meta").textContent = "Streaming…";
+    setChatBusy(true);
     const started = performance.now();
+    const abort = new AbortController();
+    state.chatAbort = abort;
+
     const payload = {
       endpoint: s.endpoint,
       engine: s.engine,
       model,
-      messages: state.chatHistory.map(({ role, content }) => ({ role, content })),
+      messages: state.chatHistory.slice(0, -1).map(({ role, content }) => ({ role, content })),
       think: byId("chat-think").value,
       require_loaded: true,
-      stream: false,
+      stream: true,
     };
-    // Omit max_tokens entirely for model default — do not send a silent cap.
     if (mt.value != null) payload.max_tokens = mt.value;
+    if (Object.keys(timeouts).length) payload.timeouts = timeouts;
+
+    let gotPartial = false;
+    let finalMeta = {
+      ok: true,
+      model,
+      elapsed_ms: null,
+      completion_tokens: null,
+      tokens_per_sec: null,
+      done_reason: null,
+      finish_reason: null,
+      stop_reason: null,
+      diagnostic_id: null,
+      diagnostic_url: null,
+      timed_out: false,
+      timeout_kind: null,
+      partial: false,
+      error: null,
+    };
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abort.signal,
         body: JSON.stringify(payload),
       });
-      const body = await res.json();
-      const elapsed = Math.round(performance.now() - started);
-      if (!body.ok) {
-        state.chatHistory.push({
-          role: "assistant",
-          content: `Error: ${body.error || "request failed"}`,
-          diagHtml: diagSummaryHtml(body, model, mt.label),
-        });
-        byId("chat-stats").textContent = `Failed in ${elapsed} ms`;
-      } else {
-        state.chatHistory.push({
-          role: "assistant",
-          content: body.content || "",
-          thinking: body.thinking || "",
-          diagnostic_id: body.diagnostic_id || null,
-          diagHtml: diagSummaryHtml(body, model, mt.label),
-        });
-        const stop = body.stop_reason || {};
-        const stopBit = stop.label
-          ? ` · ${stop.label}${stop.confidence ? ` (${stop.confidence})` : ""}`
-          : (body.done_reason || body.finish_reason
-            ? ` · stop=${body.done_reason || body.finish_reason}` : "");
-        byId("chat-stats").innerHTML =
-          `${elapsed} ms · ${body.completion_tokens != null ? body.completion_tokens + " tokens" : "tokens n/a"}` +
-          (body.tokens_per_sec != null ? ` · ${body.tokens_per_sec} tok/s` : "") +
-          ` · output=${esc(mt.label)}` +
-          stopBit +
-          ` · ${s.engine} · ${model}` +
-          (body.diagnostic_id
-            ? ` · <a href="${esc(body.diagnostic_url || (FLEET_MONITOR + "/#mcc?diag=" + body.diagnostic_id))}" target="_blank" rel="noreferrer">Diagnostics ${esc(body.diagnostic_id)}</a>`
-            : "");
+      if (!res.ok && !res.body) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
       }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let sseMode = String(s.engine || "").toLowerCase().includes("ollama") === false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
+
+          // OpenAI SSE passthrough
+          if (line.startsWith("data:")) {
+            sseMode = true;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") {
+              finalMeta.ok = finalMeta.ok !== false;
+              continue;
+            }
+            let chunk;
+            try { chunk = JSON.parse(data); } catch { continue; }
+            const choices = chunk.choices || [];
+            if (choices.length) {
+              const delta = choices[0].delta || {};
+              if (delta.content) {
+                gotPartial = true;
+                state.chatHistory[assistantIdx].content += delta.content;
+                renderChat();
+                byId("chat-stats").textContent = "Generating…";
+              }
+              if (choices[0].finish_reason) {
+                finalMeta.finish_reason = choices[0].finish_reason;
+              }
+            }
+            if (chunk.usage) {
+              finalMeta.completion_tokens = chunk.usage.completion_tokens;
+              finalMeta.prompt_tokens = chunk.usage.prompt_tokens;
+            }
+            continue;
+          }
+
+          let body;
+          try { body = JSON.parse(line); } catch { continue; }
+
+          // AI Lab error / diagnostic_meta / Ollama NDJSON
+          if (body.type === "diagnostic_meta") {
+            Object.assign(finalMeta, {
+              diagnostic_id: body.diagnostic_id || finalMeta.diagnostic_id,
+              diagnostic_url: body.diagnostic_url || finalMeta.diagnostic_url,
+              stop_reason: body.stop_reason || finalMeta.stop_reason,
+              timeout_kind: body.timeout_kind || finalMeta.timeout_kind,
+              request_id: body.request_id,
+              elapsed_ms: body.elapsed_ms != null ? body.elapsed_ms : finalMeta.elapsed_ms,
+              completion_tokens: body.completion_tokens != null
+                ? body.completion_tokens : finalMeta.completion_tokens,
+              done_reason: body.done_reason || finalMeta.done_reason,
+              finish_reason: body.finish_reason || finalMeta.finish_reason,
+              partial: !!body.partial || finalMeta.partial,
+              error: body.error || finalMeta.error,
+              ok: body.ok !== false && !body.error,
+              timed_out: !!(body.timeout_kind || (body.error || "").toLowerCase().includes("timeout")),
+            });
+            continue;
+          }
+
+          if (body.ok === false) {
+            finalMeta.ok = false;
+            finalMeta.error = body.error || "chat failed";
+            finalMeta.timeout_kind = body.timeout_kind || finalMeta.timeout_kind;
+            finalMeta.partial = !!body.partial || gotPartial;
+            finalMeta.timed_out = !!(body.timeout_kind
+              || String(body.error || "").toLowerCase().includes("timeout"));
+            continue;
+          }
+
+          // Ollama NDJSON chunk
+          if (body.message) {
+            const msg = body.message;
+            if (msg.content) {
+              gotPartial = true;
+              state.chatHistory[assistantIdx].content += msg.content;
+              renderChat();
+              byId("chat-stats").textContent = "Generating…";
+            }
+            if (msg.thinking) {
+              state.chatHistory[assistantIdx].thinking =
+                (state.chatHistory[assistantIdx].thinking || "") + msg.thinking;
+            }
+          }
+          if (body.done === true) {
+            finalMeta.done_reason = body.done_reason || finalMeta.done_reason;
+            finalMeta.completion_tokens = body.eval_count != null
+              ? body.eval_count : finalMeta.completion_tokens;
+            if (body.eval_count && body.eval_duration) {
+              finalMeta.tokens_per_sec = Math.round(
+                (body.eval_count / (body.eval_duration / 1e9)) * 100) / 100;
+            }
+          }
+        }
+      }
+
+      const elapsed = Math.round(performance.now() - started);
+      if (finalMeta.elapsed_ms == null) finalMeta.elapsed_ms = elapsed;
+      finalMeta.partial = finalMeta.partial || (gotPartial && finalMeta.ok === false);
+      const content = state.chatHistory[assistantIdx].content || "";
+      if (!content && finalMeta.error) {
+        state.chatHistory[assistantIdx].content = `Error: ${finalMeta.error}`;
+      } else if (!content) {
+        state.chatHistory[assistantIdx].content = "(empty response)";
+      }
+      if (finalMeta.partial && content && !String(content).startsWith("Error:")) {
+        // keep partial text; mark incomplete in diag
+      }
+      state.chatHistory[assistantIdx].diagnostic_id = finalMeta.diagnostic_id || null;
+      state.chatHistory[assistantIdx].diagHtml = diagSummaryHtml(finalMeta, model, mt.label);
       renderChat();
+
+      const stop = finalMeta.stop_reason || {};
+      const stopBit = stop.label
+        ? ` · ${stop.label}${stop.confidence ? ` (${stop.confidence})` : ""}`
+        : (finalMeta.timeout_kind
+          ? ` · timeout=${finalMeta.timeout_kind}`
+          : (finalMeta.done_reason || finalMeta.finish_reason
+            ? ` · stop=${finalMeta.done_reason || finalMeta.finish_reason}` : ""));
+      byId("chat-stats").innerHTML =
+        `${finalMeta.elapsed_ms} ms · ${finalMeta.completion_tokens != null ? finalMeta.completion_tokens + " tokens" : "tokens n/a"}` +
+        (finalMeta.tokens_per_sec != null ? ` · ${finalMeta.tokens_per_sec} tok/s` : "") +
+        ` · output=${esc(mt.label)}` +
+        (finalMeta.partial ? " · partial" : "") +
+        stopBit +
+        ` · ${s.engine} · ${model}` +
+        (finalMeta.diagnostic_id
+          ? ` · <a href="${esc(finalMeta.diagnostic_url || (FLEET_MONITOR + "/#mcc?diag=" + finalMeta.diagnostic_id))}" target="_blank" rel="noreferrer">Diagnostics ${esc(finalMeta.diagnostic_id)}</a>`
+          : "");
+      byId("chat-meta").textContent = finalMeta.timed_out
+        ? `Timed out (${finalMeta.timeout_kind || "unknown"})`
+        : (finalMeta.error ? String(finalMeta.error) : "Stream complete");
+      if (finalMeta.timed_out || finalMeta.error) {
+        byId("chat-meta").textContent =
+          diagWarning(finalMeta) || finalMeta.error || "Chat incomplete";
+      }
     } catch (err) {
-      state.chatHistory.push({ role: "assistant", content: `Error: ${err.message || err}` });
-      renderChat();
-      byId("chat-stats").textContent = "Network or timeout error";
+      if (err.name === "AbortError") {
+        const content = state.chatHistory[assistantIdx].content || "";
+        if (content) {
+          state.chatHistory[assistantIdx].diagHtml = diagSummaryHtml({
+            ok: false, cancelled: true, partial: true, model,
+            elapsed_ms: Math.round(performance.now() - started),
+            stop_reason: { label: "Streaming Interrupted", code: "streaming_interrupted" },
+          }, model, mt.label);
+          byId("chat-stats").textContent = "Cancelled · partial response preserved";
+        } else {
+          state.chatHistory.splice(assistantIdx, 1);
+          state.chatHistory.pop();
+          byId("chat-stats").textContent = "Cancelled";
+        }
+        renderChat();
+        byId("chat-meta").textContent = "Cancelled by user";
+      } else {
+        const content = state.chatHistory[assistantIdx].content || "";
+        if (gotPartial && content) {
+          state.chatHistory[assistantIdx].diagHtml = diagSummaryHtml({
+            ok: false, error: String(err.message || err), partial: true, model,
+            elapsed_ms: Math.round(performance.now() - started),
+          }, model, mt.label);
+          byId("chat-stats").textContent = `Error · partial preserved · ${err.message || err}`;
+        } else {
+          state.chatHistory[assistantIdx].content = `Error: ${err.message || err}`;
+          byId("chat-stats").textContent = "Network or timeout error";
+        }
+        renderChat();
+      }
+    } finally {
+      state.chatAbort = null;
+      setChatBusy(false);
     }
   });
 
@@ -697,6 +944,7 @@
     PREF_CHAT_MODE, PREF_CHAT_CUSTOM);
   bindMaxTokenControls("cmp-max-mode", "cmp-max-custom", "cmp-max-custom-wrap",
     PREF_CMP_MODE, PREF_CMP_CUSTOM);
+  bindTimeoutPrefs();
 
   refreshDiscovery().then(loadQrLinks);
   renderChat();

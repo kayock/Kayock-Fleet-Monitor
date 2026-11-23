@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>FOXAI AI Lab Command Center</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261123a" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261123b" />
 </head>
 <body>
   <header class="top">
@@ -66,8 +66,16 @@
           <label id="chat-max-custom-wrap" hidden>Custom max tokens
             <input id="chat-max-custom" type="number" min="1" step="1" placeholder="e.g. 512" />
           </label>
+          <label>First-token timeout (s)
+            <input id="chat-timeout-first" type="number" min="5" step="1" placeholder="90" />
+          </label>
+          <label>Stream inactivity timeout (s)
+            <input id="chat-timeout-idle" type="number" min="5" step="1" placeholder="120" />
+          </label>
+          <div class="mini">Streaming chat uses inactivity between chunks — not a fixed 90s total. Leave blank for server defaults.</div>
           <div id="chat-meta" class="note"></div>
           <button type="button" id="chat-clear">Clear chat</button>
+          <button type="button" id="chat-cancel" hidden>Cancel request</button>
         </aside>
         <div class="chat-main">
           <div id="chat-log" class="chat-log" aria-live="polite"></div>
@@ -135,6 +143,6 @@
     <span id="foot-ts"></span>
   </footer>
   <script src="/qr/vendor/qrcode.js"></script>
-  <script src="/static/app.js?v=20261123a"></script>
+  <script src="/static/app.js?v=20261123b"></script>
 </body>
 </html>

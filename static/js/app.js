@@ -2067,24 +2067,29 @@
       } else {
         rows.forEach(function (r) {
           var stop = r.stop_reason || {};
+          var tkind = r.timeout_kind || stop.timeout_kind || "";
           html += '<div class="diag-finding">'
             + '<div><b>' + esc(r.id || "") + '</b> · ' + esc(r.client || "")
             + ' · ' + esc(new Date((r.ts || 0) * 1000).toLocaleString()) + '</div>'
             + '<div class="mini">ok=' + esc(String(r.ok))
             + ' · stop=' + esc(stop.label || "—")
             + ' (' + esc(stop.confidence || "") + ')'
+            + (tkind ? ' · timeout_kind=' + esc(tkind) : "")
+            + (r.partial ? ' · partial' : "")
             + ' · prompt=' + esc(r.prompt_tokens != null ? r.prompt_tokens : "—")
             + ' · completion=' + esc(r.completion_tokens != null ? r.completion_tokens : "—")
-            + ' · max_tokens=' + esc((r.request && (r.request.max_tokens || r.request.max_output)) || "—")
+            + ' · max_tokens=' + esc((r.request && (r.request.max_tokens || r.request.max_output)) != null
+              ? (r.request.max_tokens || r.request.max_output) : "model default")
             + ' · ' + esc(r.elapsed_ms != null ? r.elapsed_ms + " ms" : "")
             + (r.tokens_per_sec != null ? " · " + r.tokens_per_sec + " tok/s" : "")
             + '</div>';
-          if (mode !== "simple" && r.error) {
+          if ((mode !== "simple" || tkind) && r.error) {
             html += '<div class="mini">error: ' + esc(r.error) + '</div>';
           }
           if (mode === "expert") {
             html += '<div class="mini">done_reason=' + esc(r.done_reason || "—")
-              + ' finish_reason=' + esc(r.finish_reason || "—") + '</div>';
+              + ' finish_reason=' + esc(r.finish_reason || "—")
+              + (tkind ? ' timeout_kind=' + esc(tkind) : "") + '</div>';
           }
           html += '</div>';
         });
@@ -2178,6 +2183,113 @@
     });
     openModal("diag-modal");
     fetchDiagnostics(card);
+  }
+
+  function openDiagnosticsByRecordId(recordId) {
+    if (!recordId) return;
+    setView("mcc", null);
+    state.diag.card = { model: "(from diagnostic link)", friendly_name: "Diagnostic record" };
+    state.diag.tab = "overview";
+    state.diag.data = null;
+    state.diag.reportText = "";
+    var title = document.getElementById("diag-modal-title");
+    if (title) title.textContent = "Diagnostics · record " + recordId;
+    openModal("diag-modal");
+    var body = document.getElementById("diag-modal-body");
+    if (body) body.innerHTML = "<div class='note'>Loading diagnostic record "
+      + esc(recordId) + "…</div>";
+    fetch("/api/diagnostics/record/" + encodeURIComponent(recordId) + "?soft=1", {
+      cache: "no-store",
+    }).then(function (r) { return r.json().then(function (j) {
+      return { status: r.status, body: j };
+    }); }).then(function (res) {
+      if (!res.body || !res.body.ok || !res.body.data) {
+        if (body) body.innerHTML = '<div class="diag-finding error">'
+          + "<b>Diagnostic record not found</b>"
+          + "<div>Requested id: <code>" + esc(recordId) + "</code></div>"
+          + "<div>HTTP status: " + esc(res.status) + "</div>"
+          + "<div>Endpoint: GET /api/diagnostics/record/" + esc(recordId) + "</div>"
+          + "<div>" + esc((res.body && res.body.message) || "not found") + "</div>"
+          + (res.body && res.body.lookup
+            ? "<div>Lookup: " + esc(JSON.stringify(res.body.lookup)) + "</div>" : "")
+          + "</div>";
+        return;
+      }
+      var rec = res.body.data;
+      var lookup = res.body.lookup || {};
+      state.diag.card = {
+        model: rec.model,
+        machine: rec.machine,
+        endpoint: rec.endpoint,
+        engine: rec.engine,
+        friendly_name: rec.model || recordId,
+      };
+      if (title) {
+        title.textContent = "Diagnostics · " + (rec.model || recordId)
+          + (lookup.match === "soft_id"
+            ? " (matched " + (lookup.resolved_id || rec.id) + ")"
+            : "");
+      }
+      // Hydrate inspect view around this record's identity, then highlight it.
+      return fetchDiagnostics(state.diag.card).then(function () {
+        if (!state.diag.data) state.diag.data = {};
+        state.diag.data.focus_record = rec;
+        state.diag.data.focus_lookup = lookup;
+        state.diag.tab = "requests";
+        document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
+          b.classList.toggle("active", b.getAttribute("data-diag-tab") === "requests");
+        });
+        renderDiagBody();
+        // Ensure the focused record is visible even if inspect filtered it out
+        var host = document.getElementById("diag-modal-body");
+        if (host && rec) {
+          var focus = document.createElement("div");
+          focus.className = "diag-section";
+          focus.innerHTML = "<h4>Linked diagnostic record</h4>"
+            + '<div class="diag-finding error">'
+            + "<div><b>Id:</b> <code>" + esc(rec.id) + "</code>"
+            + (lookup.match === "soft_id"
+              ? " <span class='mini'>(soft-matched from " + esc(recordId)
+                + ", distance " + esc(lookup.distance) + ")</span>"
+              : "")
+            + "</div>"
+            + "<div><b>Model:</b> " + esc(rec.model) + " · <b>Machine:</b> "
+            + esc(rec.machine || "—") + "</div>"
+            + "<div><b>Stop:</b> " + esc((rec.stop_reason && rec.stop_reason.label) || "—")
+            + ((rec.timeout_kind || (rec.stop_reason && rec.stop_reason.timeout_kind))
+              ? " · timeout_kind=" + esc(rec.timeout_kind
+                || (rec.stop_reason && rec.stop_reason.timeout_kind))
+              : "")
+            + "</div>"
+            + "<div><b>Duration:</b> " + esc(rec.elapsed_ms != null ? rec.elapsed_ms + " ms" : "—")
+            + " · <b>ok:</b> " + esc(String(rec.ok))
+            + (rec.error ? " · <b>error:</b> " + esc(rec.error) : "")
+            + "</div></div>";
+          host.insertBefore(focus, host.firstChild);
+        }
+      });
+    }).catch(function (err) {
+      if (body) body.innerHTML = '<div class="diag-finding error">'
+        + "Failed to load record: " + esc(err && err.message ? err.message : err)
+        + "</div>";
+    });
+  }
+
+  function applyDiagHash() {
+    var raw = (location.hash || "").replace(/^#/, "");
+    if (!raw) return;
+    // Support #mcc?diag=<id> and #diag=<id>
+    var diagId = null;
+    if (raw.indexOf("mcc") === 0 && raw.indexOf("diag=") >= 0) {
+      var q = raw.split("?")[1] || "";
+      q.split("&").forEach(function (part) {
+        var kv = part.split("=");
+        if (kv[0] === "diag") diagId = decodeURIComponent(kv[1] || "");
+      });
+    } else if (raw.indexOf("diag=") === 0) {
+      diagId = decodeURIComponent(raw.slice(5));
+    }
+    if (diagId) openDiagnosticsByRecordId(diagId);
   }
 
   function diagFetchReport(asText) {
@@ -2614,9 +2726,14 @@
   // debug handle (harmless in production, invaluable for diagnosis)
   window.__MONITOR_STATE = state;
   // Bind MCC after DOM hooks exist
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bindMCC);
-  } else {
+  function bootMCC() {
     bindMCC();
+    applyDiagHash();
+    window.addEventListener("hashchange", applyDiagHash);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootMCC);
+  } else {
+    bootMCC();
   }
 })();
