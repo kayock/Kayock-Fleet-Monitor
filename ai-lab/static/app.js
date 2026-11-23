@@ -266,11 +266,23 @@
           role: "assistant",
           content: body.content || "",
           thinking: body.thinking || "",
+          diagnostic_id: body.diagnostic_id || null,
         });
-        byId("chat-stats").textContent =
+        const stop = body.stop_reason || {};
+        const stopBit = stop.label
+          ? ` · ${stop.label}${stop.confidence ? ` (${stop.confidence})` : ""}`
+          : (body.done_reason || body.finish_reason
+            ? ` · stop=${body.done_reason || body.finish_reason}` : "");
+        const maxTok = (body.request && body.request.max_tokens) || 96;
+        byId("chat-stats").innerHTML =
           `${elapsed} ms · ${body.completion_tokens != null ? body.completion_tokens + " tokens" : "tokens n/a"}` +
           (body.tokens_per_sec != null ? ` · ${body.tokens_per_sec} tok/s` : "") +
-          ` · ${s.engine} · ${model}`;
+          ` · max_tokens=${maxTok}` +
+          stopBit +
+          ` · ${s.engine} · ${model}` +
+          (body.diagnostic_id
+            ? ` · <a href="${esc(body.diagnostic_url || ("http://10.0.0.202:5000/#mcc?diag=" + body.diagnostic_id))}" target="_blank" rel="noreferrer">Diagnostics ${esc(body.diagnostic_id)}</a>`
+            : "");
       }
       renderChat();
     } catch (err) {

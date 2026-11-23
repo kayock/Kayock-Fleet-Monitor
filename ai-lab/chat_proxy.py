@@ -2,14 +2,23 @@
 
 Does not start, load, switch, or unload models. Requests go only to endpoints
 the caller selected. Thinking parameters are sent for Ollama only.
+
+Completed requests emit metadata-only diagnostics to Fleet Monitor when
+configured (no prompts/responses/secrets).
 """
 from __future__ import annotations
 
 import json
+import os
+import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Iterator
+from typing import Iterator
+from urllib.parse import urlparse
+
+# Default: Station-local Fleet Monitor diagnostics ingest (no auth).
+_DEFAULT_DIAG_URL = "http://127.0.0.1:5000/api/diagnostics/ingest"
 
 
 def _request(method: str, url: str, payload: dict | None = None,
@@ -30,6 +39,74 @@ def _engine_family(engine: str) -> str:
                             "vllm", "sglang", "lm-studio", "lemonade")):
         return "openai"
     return "auto"
+
+
+def _machine_guess(endpoint: str) -> str | None:
+    try:
+        host = urlparse(endpoint).hostname or ""
+    except Exception:
+        host = ""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return socket.gethostname()
+    mapping = {
+        "10.0.0.202": "Ubuntu Station",
+        "10.0.0.45": "Ubuntu Portable",
+        "10.0.0.104": "Windows",
+    }
+    return mapping.get(host)
+
+
+def _emit_diagnostic(result: dict, *, client: str = "foxai-ai-lab") -> None:
+    """Best-effort metadata post to Fleet Monitor. Never blocks chat on failure."""
+    url = (os.environ.get("FLEET_DIAGNOSTICS_URL") or _DEFAULT_DIAG_URL).strip()
+    if not url or os.environ.get("FLEET_DIAGNOSTICS_DISABLE") == "1":
+        return
+    req_meta = dict(result.get("request") or {})
+    for banned in ("messages", "prompt", "content"):
+        req_meta.pop(banned, None)
+    payload = {
+        "client": client,
+        "ok": result.get("ok"),
+        "model": result.get("model"),
+        "engine": result.get("engine"),
+        "endpoint": result.get("endpoint"),
+        "machine": result.get("machine") or _machine_guess(result.get("endpoint") or ""),
+        "prompt_tokens": result.get("prompt_tokens"),
+        "completion_tokens": result.get("completion_tokens"),
+        "tokens_per_sec": result.get("tokens_per_sec"),
+        "elapsed_ms": result.get("elapsed_ms"),
+        "done_reason": result.get("done_reason"),
+        "finish_reason": result.get("finish_reason"),
+        "error": result.get("error"),
+        "timed_out": bool(result.get("timed_out")),
+        "connection_error": bool(result.get("connection_error")),
+        "stream_complete": result.get("stream_complete"),
+        "prompt_eval_duration_ns": result.get("prompt_eval_duration_ns"),
+        "eval_duration_ns": result.get("eval_duration_ns"),
+        "request": req_meta,
+        # Privacy: never include prompts/responses
+    }
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            raw = resp.read(8192)
+            try:
+                body = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                body = {}
+            data_out = body.get("data") if isinstance(body, dict) else None
+            if isinstance(data_out, dict) and data_out.get("id"):
+                result["diagnostic_id"] = data_out["id"]
+                result["stop_reason"] = data_out.get("stop_reason")
+                result["findings"] = data_out.get("findings")
+                fm = os.environ.get("FLEET_MONITOR_URL") or "http://10.0.0.202:5000"
+                result["diagnostic_url"] = (
+                    f"{fm.rstrip('/')}/#mcc?diag={data_out['id']}")
+    except Exception:
+        pass
 
 
 def list_loaded_models(endpoint: str, engine: str) -> dict:
@@ -147,26 +224,38 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
         loaded_ids = {m["id"] for m in info.get("loaded") or []}
         detected = _engine_family(info.get("engine") or engine)
         if detected == "ollama" and loaded_ids and model not in loaded_ids:
-            return {
+            result = {
                 "ok": False,
                 "error": (f"Model {model!r} is not currently loaded. "
                           "AI Lab will not load models automatically."),
                 "elapsed_ms": round((time.time() - started) * 1000, 1),
+                "model": model, "engine": engine, "endpoint": base,
+                "request": {"max_tokens": int(max_tokens), "think": think},
             }
+            _emit_diagnostic(result, client="foxai-ai-lab")
+            return result
         if detected == "ollama" and not loaded_ids:
-            return {
+            result = {
                 "ok": False,
                 "error": ("No models are currently loaded on this Ollama server. "
                           "Load one manually first; AI Lab will not auto-load."),
                 "elapsed_ms": round((time.time() - started) * 1000, 1),
+                "model": model, "engine": engine, "endpoint": base,
+                "request": {"max_tokens": int(max_tokens), "think": think},
             }
+            _emit_diagnostic(result, client="foxai-ai-lab")
+            return result
         if detected == "openai" and loaded_ids and model not in loaded_ids:
-            return {
+            result = {
                 "ok": False,
                 "error": (f"Model {model!r} is not available on this endpoint. "
                           "AI Lab will not substitute another model."),
                 "elapsed_ms": round((time.time() - started) * 1000, 1),
+                "model": model, "engine": engine, "endpoint": base,
+                "request": {"max_tokens": int(max_tokens), "think": think},
             }
+            _emit_diagnostic(result, client="foxai-ai-lab")
+            return result
 
     try:
         if family == "ollama" or (family == "auto" and "ollama" in (engine or "").lower()):
@@ -187,10 +276,11 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
             thinking = msg.get("thinking")
             eval_count = body.get("eval_count")
             eval_duration = body.get("eval_duration")  # ns
+            prompt_eval_duration = body.get("prompt_eval_duration")
             tps = None
             if eval_count and eval_duration:
                 tps = round(eval_count / (eval_duration / 1e9), 2)
-            return {
+            result = {
                 "ok": True,
                 "engine": "ollama",
                 "model": model,
@@ -200,8 +290,20 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
                 "completion_tokens": eval_count,
                 "tokens_per_sec": tps,
                 "elapsed_ms": round((time.time() - started) * 1000, 1),
+                "done_reason": body.get("done_reason"),
+                "prompt_eval_duration_ns": prompt_eval_duration,
+                "eval_duration_ns": eval_duration,
                 "raw_keys": sorted(body.keys()),
+                "request": {
+                    "max_tokens": int(max_tokens),
+                    "think": think,
+                    "stream": False,
+                    "num_predict": int(max_tokens),
+                },
+                "endpoint": base,
             }
+            _emit_diagnostic(result, client="foxai-ai-lab")
+            return result
 
         # OpenAI-compatible (llama.cpp, vLLM, etc.) — never send think
         payload = {
@@ -220,7 +322,7 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
         elapsed = time.time() - started
         comp = usage.get("completion_tokens")
         tps = round(comp / elapsed, 2) if comp and elapsed > 0 else None
-        return {
+        result = {
             "ok": True,
             "engine": "openai-compatible",
             "model": model,
@@ -230,17 +332,37 @@ def chat_completion(*, endpoint: str, engine: str, model: str,
             "completion_tokens": comp,
             "tokens_per_sec": tps,
             "elapsed_ms": round(elapsed * 1000, 1),
+            "finish_reason": choice.get("finish_reason"),
+            "request": {
+                "max_tokens": int(max_tokens),
+                "think": None,
+                "stream": False,
+            },
+            "endpoint": base,
         }
+        _emit_diagnostic(result, client="foxai-ai-lab")
+        return result
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read(2048).decode("utf-8", "replace")
         except Exception:
             detail = str(exc)
-        return {"ok": False, "error": f"HTTP {exc.code}: {detail[:400]}",
-                "elapsed_ms": round((time.time() - started) * 1000, 1)}
+        result = {"ok": False, "error": f"HTTP {exc.code}: {detail[:400]}",
+                  "elapsed_ms": round((time.time() - started) * 1000, 1),
+                  "model": model, "engine": engine, "endpoint": base,
+                  "request": {"max_tokens": int(max_tokens), "think": think}}
+        _emit_diagnostic(result, client="foxai-ai-lab")
+        return result
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                "elapsed_ms": round((time.time() - started) * 1000, 1)}
+        timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
+        conn = "connection" in str(exc).lower() or "refused" in str(exc).lower()
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                  "elapsed_ms": round((time.time() - started) * 1000, 1),
+                  "model": model, "engine": engine, "endpoint": base,
+                  "timed_out": timed_out, "connection_error": conn,
+                  "request": {"max_tokens": int(max_tokens), "think": think}}
+        _emit_diagnostic(result, client="foxai-ai-lab")
+        return result
 
 
 def stream_ollama_chat(*, endpoint: str, model: str, messages: list[dict],

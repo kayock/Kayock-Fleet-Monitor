@@ -197,6 +197,31 @@
     </div>
   </div>
 
+  <!-- AI Diagnostics panel (v3.3, read-only) -->
+  <div class="modal-overlay" id="diag-modal" hidden>
+    <div class="modal mcc-modal diag-modal">
+      <div class="modal-head">
+        <h3 id="diag-modal-title">Diagnostics</h3>
+        <button class="tab" id="diag-modal-close" type="button">✕</button>
+      </div>
+      <div class="sort-tabs diag-tabs" id="diag-tabs">
+        <button type="button" class="tab active" data-diag-tab="overview">Overview</button>
+        <button type="button" class="tab" data-diag-tab="configuration">Configuration</button>
+        <button type="button" class="tab" data-diag-tab="requests">Recent Requests</button>
+        <button type="button" class="tab" data-diag-tab="troubleshooting">Troubleshooting</button>
+        <button type="button" class="tab" data-diag-tab="reports">Reports</button>
+      </div>
+      <div class="modal-body" id="diag-modal-body">
+        <div class="note">Loading diagnostics…</div>
+      </div>
+      <div class="modal-foot">
+        <button class="tab" id="diag-copy-report" type="button">Copy Diagnostic Report</button>
+        <button class="tab" id="diag-export-json" type="button">Export JSON</button>
+        <button class="tab" id="diag-modal-cancel" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== System + local AI servers (this machine OR a fleet machine) ===== -->
   <div id="view-machine">
   <main class="grid">

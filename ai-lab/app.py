@@ -19,7 +19,7 @@ import discovery
 ROOT = Path(__file__).resolve().parent
 QR_SRC = Path("/home/kayock/Projects/Kayock-QR-Generator/src")
 APP_NAME = "FOXAI AI Lab Command Center"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 app = Flask(__name__, static_folder=str(ROOT / "static"),
             template_folder=str(ROOT / "templates"))

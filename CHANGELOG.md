@@ -2,6 +2,36 @@
 
 All notable changes to Kayock Fleet Monitor are documented in this file.
 
+## [v3.3.0-dev] — 2026-11-23
+
+AI Diagnostics & Troubleshooting Center (development branch
+`feature/ai-diagnostics-v3.3`). Read-only by default; does not alter inference
+configurations or restart services.
+
+### Added
+
+- **Model Configuration Inspector** — Diagnostics button on MCC cards; live
+  read-only inspection via Ollama `/api/show`+`/api/ps`, llama.cpp `/props`,
+  LM Studio and Lemonade capability-aware probes
+- **Inference request metadata** — stop-reason classification, token accounting,
+  timing, bounded local history (`diagnostic_history.json`)
+- **FOXAI AI Lab bridge** — chat/compare posts metadata-only records to
+  `/api/diagnostics/ingest`; UI shows stop reason + Diagnostics link
+- **Rules-based troubleshooting** — deterministic findings (output limit,
+  context, timeout, connection, model unavailable, slow generation)
+- **Configuration conflict detection** — distinguishes intentional overrides vs
+  potential conflicts across model/server/profile/request layers
+- **Performance history** — completed/failed counts, avg tok/s, timeouts,
+  output-limit occurrences (from captured requests only)
+- **Diagnostic reports** — Copy text / Export JSON with privacy sanitization
+
+### Safety / non-goals
+
+- Never invents missing values; unknown fields labeled explicitly
+- Does not store prompts, responses, or credentials
+- Does not load/unload models, change contexts, or restart inference services
+- Not deployed to production without explicit approval
+
 ## [v3.2.2] — 2026-11-23
 
 Stable Model Control Center release: fleet-wide server registration, accurate

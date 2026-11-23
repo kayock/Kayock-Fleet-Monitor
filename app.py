@@ -30,6 +30,9 @@ import socket
 from flask import Flask, jsonify, render_template, request
 
 from ai import AIManager
+from diagnostics import (DiagnosticStore, build_diagnostic_report,
+                         detect_config_conflicts, format_report_text,
+                         inspect_model_configuration)
 from fleet import FleetManager
 from mcc import (ProfileStore, attach_profiles_to_cards, build_model_cards,
                  build_server_inventory, capabilities_for,
@@ -43,7 +46,7 @@ _werkzeug_log = logging.getLogger("werkzeug")
 _werkzeug_log.setLevel(logging.WARNING)  # avoid a log line every 2 s poll
 
 APP_NAME = "Kayock Fleet Monitor"
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.3.0-dev"
 
 
 def _json_result(ok, message, data=None, status=200):
@@ -860,6 +863,153 @@ def create_app(sampler: SystemSampler | None = None,
         ok, msg, count = profile_store.import_all(
             body, merge=bool(body.get("merge", True)))
         return _json_result(ok, msg, {"imported": count})
+
+    # ---------------- AI Diagnostics (v3.3, read-only) ----------------
+    diag_store = DiagnosticStore()
+
+    def _find_mcc_card(card_id: str | None = None, model: str | None = None,
+                      machine: str | None = None, endpoint: str | None = None):
+        cards, _, _ = _mcc_gather_cards()
+        if card_id:
+            for c in cards:
+                if c.get("id") == card_id:
+                    return c, cards
+        for c in cards:
+            if model and c.get("model") != model:
+                continue
+            if machine and c.get("machine") != machine:
+                continue
+            if endpoint and (c.get("endpoint") or "").rstrip("/") != endpoint.rstrip("/"):
+                continue
+            if model or machine or endpoint:
+                return c, cards
+        return None, cards
+
+    @app.route("/api/diagnostics/inspect", methods=["GET", "POST"])
+    def diagnostics_inspect():
+        """Read-only model configuration inspector. Never loads models."""
+        body = request.get_json(silent=True) or {}
+        card_id = body.get("card_id") or request.args.get("card_id")
+        model = body.get("model") or request.args.get("model")
+        machine = body.get("machine") or request.args.get("machine")
+        endpoint = body.get("endpoint") or request.args.get("endpoint")
+        engine = body.get("engine") or request.args.get("engine")
+        card, _ = _find_mcc_card(card_id, model, machine, endpoint)
+        profile = {}
+        if card and card.get("profile_id"):
+            profile = profile_store.get(card["profile_id"]) or {}
+        inspection = inspect_model_configuration(
+            engine=engine or (card or {}).get("engine"),
+            endpoint=endpoint or (card or {}).get("endpoint"),
+            model=model or (card or {}).get("model"),
+            configured_args=(card or {}).get("configured_args"),
+            profile=profile,
+            card=card or {
+                "machine": machine, "engine": engine, "endpoint": endpoint,
+                "model": model,
+            },
+        )
+        recent = diag_store.list(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+            limit=20,
+        )
+        perf = diag_store.performance_summary(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+        )
+        conflicts = detect_config_conflicts(inspection=inspection)
+        return jsonify({
+            "ok": True,
+            "data": {
+                "inspection": inspection,
+                "recent_requests": recent,
+                "performance": perf,
+                "conflicts": conflicts,
+                "read_only": True,
+            },
+        })
+
+    @app.route("/api/diagnostics/history", methods=["GET"])
+    def diagnostics_history():
+        rows = diag_store.list(
+            model=request.args.get("model"),
+            machine=request.args.get("machine"),
+            engine=request.args.get("engine"),
+            client=request.args.get("client"),
+            since=float(request.args["since"]) if request.args.get("since") else None,
+            limit=int(request.args.get("limit") or 50),
+        )
+        return jsonify({"ok": True, "data": rows})
+
+    @app.route("/api/diagnostics/performance", methods=["GET"])
+    def diagnostics_performance():
+        return jsonify({"ok": True, "data": diag_store.performance_summary(
+            model=request.args.get("model"),
+            machine=request.args.get("machine"),
+        )})
+
+    @app.route("/api/diagnostics/ingest", methods=["POST"])
+    def diagnostics_ingest():
+        """Accept metadata-only inference records (e.g. from FOXAI AI Lab)."""
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return _json_result(False, "JSON object required")
+        # Strip conversation content if a client accidentally includes it
+        for banned in ("prompt", "messages", "content", "response",
+                       "thinking_text", "api_key", "authorization"):
+            body.pop(banned, None)
+        rec = diag_store.add(body)
+        return jsonify({"ok": True, "data": {
+            "id": rec.get("id"),
+            "stop_reason": rec.get("stop_reason"),
+            "findings": rec.get("findings"),
+        }})
+
+    @app.route("/api/diagnostics/report", methods=["POST"])
+    def diagnostics_report():
+        body = request.get_json(silent=True) or {}
+        card_id = body.get("card_id")
+        model = body.get("model")
+        machine = body.get("machine")
+        endpoint = body.get("endpoint")
+        engine = body.get("engine")
+        card, _ = _find_mcc_card(card_id, model, machine, endpoint)
+        profile = {}
+        if card and card.get("profile_id"):
+            profile = profile_store.get(card["profile_id"]) or {}
+        inspection = inspect_model_configuration(
+            engine=engine or (card or {}).get("engine"),
+            endpoint=endpoint or (card or {}).get("endpoint"),
+            model=model or (card or {}).get("model"),
+            configured_args=(card or {}).get("configured_args"),
+            profile=profile,
+            card=card or {},
+        )
+        recent = diag_store.list(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+            limit=20,
+        )
+        perf = diag_store.performance_summary(
+            model=inspection["overview"].get("model"),
+            machine=inspection["overview"].get("machine"),
+        )
+        report = build_diagnostic_report(
+            inspection=inspection, recent=recent, performance=perf,
+            include_raw=bool(body.get("include_raw")),
+        )
+        if body.get("format") == "text":
+            return jsonify({"ok": True, "data": {
+                "text": format_report_text(report), "report": report}})
+        return jsonify({"ok": True, "data": report})
+
+    @app.route("/api/diagnostics/record/<record_id>", methods=["GET"])
+    def diagnostics_record(record_id):
+        for r in diag_store.list(limit=diag_store.maxlen):
+            if r.get("id") == record_id:
+                return jsonify({"ok": True, "data": r})
+        return _json_result(False, "record not found", status=404)
 
     return app
 

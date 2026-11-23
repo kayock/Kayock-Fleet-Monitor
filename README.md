@@ -80,6 +80,13 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 - `ai_servers.json` — your configured AI servers (created on first save).
 - `fleet.json` — fleet machines incl. the per-machine `allow_control` flag.
 
+### AI Diagnostics (v3.3)
+
+Read-only model configuration inspection, inference request history, stop-reason
+classification, and diagnostic reports. See [docs/AI_DIAGNOSTICS.md](docs/AI_DIAGNOSTICS.md).
+MCC cards include a **Diagnostics** button. FOXAI AI Lab posts metadata-only
+records to `/api/diagnostics/ingest`.
+
 ### Model Control Center (v3.2.2)
 
 Open the **Model Control** tab for fleet-wide model inventory and management
