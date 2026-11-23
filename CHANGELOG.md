@@ -2,11 +2,35 @@
 
 All notable changes to Kayock Fleet Monitor are documented in this file.
 
+## [v3.3.1] — 2026-11-23
+
+Stable release of AI Diagnostics plus streaming-timeout and diagnostic-lookup
+fixes. Merged from `feature/ai-diagnostics-v3.3`. Companion **FOXAI AI Lab
+v1.3.1** is published separately at
+[kayock/FOXAI-AI-Lab](https://github.com/kayock/FOXAI-AI-Lab).
+
+### Fixed
+
+- Soft-match diagnostic record lookup (`GET /api/diagnostics/record/<id>?soft=1`)
+  so transcription typos (for example `a822…` → `a82d…`) still resolve
+- `#mcc?diag=<id>` deep links open MCC and retrieve the linked record (not only
+  the modal shell)
+- Stop-reason / troubleshooting distinguish `timeout_kind`
+  (`connection`, `first_token`, `stream_inactivity`, `total`, `nonstream_total`)
+- Remote peer loopback endpoints resolve to fleet host for diagnostics inspect
+  (from `4d493b2`)
+
+### Verified live
+
+- DeepSeek Q8 extended stream via AI Lab: 895 tokens, 255.6s, 3.53 tok/s,
+  normal completion; diagnostic `0baa669fdd5b` retrieved in Fleet Monitor
+- Three-machine fleet connectivity preserved; inference services not restarted
+
 ## [v3.3.0] — 2026-11-23
 
-AI Diagnostics & Troubleshooting Center deployed on Ubuntu Station from
-`feature/ai-diagnostics-v3.3` (not yet tagged/merged to master). Read-only by
-default; does not alter inference configurations or restart inference services.
+AI Diagnostics & Troubleshooting Center (pre-release station deploy from
+`feature/ai-diagnostics-v3.3`). Read-only by default; does not alter inference
+configurations or restart inference services.
 
 Station deploy commit: `3c9acc0` + `APP_VERSION=3.3.0` bump. AI Lab runtime
 `/home/kayock/Applications/FoxaiAiLab` at v1.3.0.

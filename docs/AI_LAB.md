@@ -10,25 +10,45 @@ AI Lab is a **companion application** to Kayock Fleet Monitor. It is not a repla
 |---|---|
 | Fleet Monitor (`:5000` / peer ports) | Machine metrics, AI server inventory, GPU/CPU samplers |
 | AI Lab (`:3010`) | Operator UI for chat/compare/QR against verified endpoints |
-| Source in this repo | `ai-lab/` (independent runtime; see Install) |
+| Canonical GitHub repo | [kayock/FOXAI-AI-Lab](https://github.com/kayock/FOXAI-AI-Lab) (v1.3.1) |
+| Convenience mirror in Fleet Monitor | `ai-lab/` |
 | Runtime on Ubuntu Station | `/home/kayock/Applications/FoxaiAiLab` via user systemd `foxai-ai-lab.service` |
 
 Do not merge AI Lab into the Fleet Monitor Python process. Keep the separate port and service so chat timeouts cannot stall fleet sampling.
 
+## Streaming timeouts (v1.3.1)
+
+Direct Chat streams by default. Defaults:
+
+- connect 10s · first-token 90s · stream inactivity 120s · streaming total **none**
+- non-stream / compare total remains 90s (`AI_LAB_NONSTREAM_TOTAL_TIMEOUT`)
+
+Slow but actively generating models are not killed solely by a short fixed
+wall-clock limit. See `/api/settings/timeouts` and the Direct Chat timeout fields.
+
 ## Install (Ubuntu Station)
 
+Preferred — clone the dedicated repository:
+
 ```bash
-# From a checkout of this repository:
-rsync -a --exclude='.venv' --exclude='__pycache__' ai-lab/ ~/Applications/FoxaiAiLab/
+git clone https://github.com/kayock/FOXAI-AI-Lab.git ~/Applications/FoxaiAiLab
 cd ~/Applications/FoxaiAiLab
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 chmod +x start.sh
+```
 
-# User systemd unit (example in ai-lab/deploy/foxai-ai-lab.service)
+Or sync from the Fleet Monitor convenience mirror:
+
+```bash
+rsync -a --exclude='.venv' --exclude='__pycache__' ai-lab/ ~/Applications/FoxaiAiLab/
+```
+
+User systemd unit example: `deploy/foxai-ai-lab.service` (or `ai-lab/deploy/` in Fleet Monitor).
+
+```bash
 mkdir -p ~/.config/systemd/user
-cp ai-lab/deploy/foxai-ai-lab.service ~/.config/systemd/user/
-# Or keep the existing unit that already points at ~/Applications/FoxaiAiLab
+cp deploy/foxai-ai-lab.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now foxai-ai-lab.service
 ```

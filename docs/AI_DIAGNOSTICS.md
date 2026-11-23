@@ -27,7 +27,7 @@ Simple / Advanced / Expert modes still apply (raw backend metadata in Expert).
 | GET | `/api/diagnostics/performance` | Aggregated performance |
 | POST | `/api/diagnostics/ingest` | Accept metadata from AI Lab |
 | POST | `/api/diagnostics/report` | Build sanitized report |
-| GET | `/api/diagnostics/record/<id>` | Single record |
+| GET | `/api/diagnostics/record/<id>` | Single record (`?soft=1` typo-tolerant id match) |
 
 ## AI Lab integration
 
@@ -36,7 +36,10 @@ AI Lab `chat_proxy.chat_completion` and streaming helpers emit records to
 
 Stored fields include model, engine, endpoint, token counts, timings,
 `done_reason` / `finish_reason`, request `max_tokens` / `max_tokens_mode`,
-`stream_complete`, and stop classification. Prompts and responses are never stored.
+`stream_complete`, `timed_out`, `timeout_kind`, `partial`, and stop
+classification. Prompts and responses are never stored.
+
+Deep link from AI Lab: `http://<fleet-monitor>/#mcc?diag=<record_id>`.
 
 Duplicate prevention: ingesting the same `request_id` twice returns the first record.
 
@@ -55,6 +58,20 @@ Preference is stored in the browser (`localStorage`). Fleet Monitor profiles are
 
 Ollama NDJSON and OpenAI SSE streams emit exactly one final diagnostic record
 (including interrupted streams, timeouts, and client cancellation).
+
+AI Lab v1.3.1 streaming timeouts:
+
+| Kind | Meaning |
+|---|---|
+| `connection` | Failed to establish HTTP connection in time |
+| `first_token` | No stream data before first-token budget |
+| `stream_inactivity` | Stall between chunks (active slow generation is allowed) |
+| `total` / `nonstream_total` | Explicit wall-clock total budget |
+
+### Soft record lookup
+
+`GET /api/diagnostics/record/<id>?soft=1` tries exact id, then `request_id`,
+then Levenshtein distance ≤ 2 for short hex ids (transcription typos).
 
 ### Token-count note
 
