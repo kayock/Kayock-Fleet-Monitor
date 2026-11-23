@@ -9,12 +9,19 @@ import pytest
 
 from mcc import (
     ProfileStore,
+    attach_profiles_to_cards,
     build_model_cards,
     capabilities_for,
+    classify_pending_for_apply,
     estimate_memory_warning,
+    guess_association,
+    management_setup_preview,
+    management_status,
+    merge_startup_args,
     parse_startup_settings,
     preview_apply_profile,
     settings_view,
+    stable_model_identity,
 )
 
 
@@ -134,6 +141,12 @@ def test_build_model_cards_loaded_and_unloaded():
     assert loaded["actions"]["unload"] is True
     assert loaded["actions"]["load"] is False
     assert unloaded["actions"]["load"] is True
+    # Unloaded cards must not inherit server-process RSS as model RAM
+    assert unloaded["ram_bytes"] is None
+    assert unloaded["model_ram_bytes"] is None
+    assert unloaded["server_ram_bytes"] == 123
+    assert loaded["management_status"]["manageable"] is True
+    assert loaded["identity"]["key"]
 
 
 def test_build_model_cards_llama_no_unload_action():
@@ -202,12 +215,245 @@ def test_profile_store_crud_and_preview(tmp_path):
     assert view["restart_required"] is True
     assert any(c["parameter"] == "context" for c in view["changes"])
     exported = store.export_all()
-    assert exported["version"] == 1
+    assert exported["version"] == 2
     store2 = ProfileStore(path=str(tmp_path / "other.json"))
     ok3, msg3, n = store2.import_all(exported, merge=False)
     assert ok3 and n >= 1
     ok4, msg4 = store.delete(p["id"])
     assert ok4
+
+
+def test_stable_identity_multi_machine():
+    a = stable_model_identity(
+        machine="Ubuntu Station", machine_id="station",
+        server={"id": "s1", "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434},
+        model="qwen2.5:3b",
+    )
+    b = stable_model_identity(
+        machine="Ubuntu Portable", machine_id="portable",
+        server={"id": "s1", "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434},
+        model="qwen2.5:3b",
+    )
+    assert a["key"] != b["key"]
+    assert "qwen2.5:3b" in a["key"]
+
+
+def test_profile_sync_no_duplicates_and_preserves_friendly(tmp_path):
+    store = ProfileStore(path=str(tmp_path / "profiles.json"))
+    servers = [{
+        "id": "abc", "key": "127.0.0.1:11434", "name": "ollama", "type": "ollama",
+        "status": "online", "configured": True,
+        "capabilities": {"can_load": True, "can_unload": True,
+                         "can_start": True, "can_stop": True, "can_restart": True},
+        "loaded_models": [{"name": "saturday-gm-gemmasutra:latest"}],
+        "installed_models": ["saturday-gm-gemmasutra:latest", "qwen2.5:3b"],
+        "host": "127.0.0.1", "port": 11434, "url": "http://127.0.0.1:11434",
+    }]
+    cards = build_model_cards(
+        machine="Ubuntu Portable", machine_id="port1", allow_control=True,
+        is_self=True, servers=servers,
+    )
+    s1 = store.sync_from_cards(cards)
+    assert s1["created"] >= 2
+    first = store.list_profiles()
+    assert len(first) == s1["created"]
+    # Customize friendly name
+    pid = first[0]["id"]
+    store.patch_user_fields(pid, {"friendly_name": "Saturday Multiverse — Game Master"})
+    s2 = store.sync_from_cards(cards)
+    assert s2["created"] == 0
+    assert len(store.list_profiles()) == len(first)
+    p = store.get(pid)
+    assert p["friendly_name"] == "Saturday Multiverse — Game Master"
+    # Offline: mark unavailable, do not delete
+    s3 = store.sync_from_cards([])
+    assert s3["unavailable"] >= 1
+    assert len(store.list_profiles()) == len(first)
+    assert any(x.get("available") is False for x in store.list_profiles())
+
+
+def test_guess_association_unverified_only():
+    a = guess_association("saturday-gm-gemmasutra:latest")
+    assert a and a["status"] == "possible_unverified"
+    assert "unverified" in a["label"].lower()
+    assert guess_association("qwen2.5:3b") is None
+
+
+def test_management_status_and_setup():
+    ms = management_status(
+        configured=False, is_self=True, allow_control=True,
+        caps=capabilities_for("ollama"),
+        server_caps={"can_load": True}, server_status="online",
+    )
+    assert ms["code"] == "setup_required"
+    assert ms["needs_setup"] is True
+    remote = management_status(
+        configured=True, is_self=False, allow_control=False,
+        caps=capabilities_for("ollama"),
+        server_caps={"can_load": True, "can_unload": True},
+        server_status="online",
+    )
+    assert remote["code"] == "remote_control_disabled"
+    card = {
+        "model": "phi", "machine": "Windows", "engine": "ollama",
+        "configured": False, "is_self": True, "allow_control": True,
+        "server_key": "127.0.0.1:11434",
+        "management_status": ms,
+        "capabilities": capabilities_for("ollama"),
+    }
+    preview = management_setup_preview(card)
+    assert preview["applies_changes"] is False
+    assert any(a["action"] == "adopt_server" for a in preview["proposed_actions"])
+
+
+def test_merge_startup_args_preserves_unknown():
+    new, notes = merge_startup_args(
+        '-m /models/qwen.gguf -c 40960 --foo bar -ngl 0',
+        {"context": 65536, "gpu_layers": 10},
+        "llama-server",
+    )
+    assert "--foo" in new and "bar" in new
+    assert "/models/qwen.gguf" in new
+    assert "65536" in new
+    assert "10" in new
+    assert notes
+
+
+def test_classify_pending_request_vs_restart():
+    c = classify_pending_for_apply(
+        "llama-server",
+        {"temperature": 0.5, "context": 8192, "gpu_layers": 20},
+    )
+    assert "temperature" in c["request_preferences"]
+    assert "context" in c["startup_settings"]
+    assert c["restart_required"] is True
+
+
+def test_attach_profiles_and_protected_patch(tmp_path):
+    store = ProfileStore(path=str(tmp_path / "p.json"))
+    cards = build_model_cards(
+        machine="Station", machine_id=None, allow_control=True, is_self=True,
+        servers=[{
+            "id": "x", "key": "127.0.0.1:11434", "name": "o", "type": "ollama",
+            "status": "online", "configured": True,
+            "capabilities": {"can_load": True, "can_unload": True,
+                             "can_start": True, "can_stop": True, "can_restart": True},
+            "loaded_models": [{"name": "m1"}],
+            "installed_models": ["m1"],
+            "host": "127.0.0.1", "port": 11434,
+        }],
+    )
+    store.sync_from_cards(cards)
+    profs = store.list_profiles()
+    store.patch_user_fields(profs[0]["id"], {
+        "protected": True, "tags": ["Application Models", "Creative"],
+    })
+    attached = attach_profiles_to_cards(cards, store.list_profiles())
+    assert attached[0]["protected"] is True
+    assert "Creative" in attached[0]["tags"]
+    assert attached[0]["friendly_name"]
+
+
+def test_settings_apply_supported_and_restart_preview(tmp_path, monkeypatch):
+    from app import create_app
+    from sampler import SystemSampler
+    from ai import AIManager
+    from fleet import FleetManager
+
+    cfg = tmp_path / "ai_servers.json"
+    cfg.write_text(json.dumps([{
+        "id": "ls1", "name": "llama", "type": "llama-server",
+        "host": "127.0.0.1", "port": 11435,
+        "exe": "/bin/true", "args": "-m /m.gguf -c 4096 -ngl 0 --keep-extra",
+        "model_dir": "",
+    }]), encoding="utf-8")
+
+    real_init = ProfileStore.__init__
+
+    def _init(self, path=None):
+        real_init(self, path=str(tmp_path / "model_profiles.json"))
+
+    monkeypatch.setattr(ProfileStore, "__init__", _init)
+
+    app = create_app(
+        sampler=SystemSampler(),
+        ai_manager=AIManager(config_path=str(cfg)),
+        fleet_manager=FleetManager(config_path=str(tmp_path / "fleet.json"),
+                                   discovery_enabled=False),
+        start_sampler=False, start_ai=False, start_fleet=False,
+        self_port=5000, machine_label="test-station",
+    )
+    client = app.test_client()
+
+    r = client.post("/api/mcc/settings/apply", json={
+        "mode": "supported",
+        "engine": "llama-server",
+        "configured_args": "-m /m.gguf -c 4096 -ngl 0 --keep-extra",
+        "pending": {"temperature": 0.2, "context": 8192},
+        "model": "kayock-local",
+        "machine": "test-station",
+        "server_id": "ls1",
+        "is_self": True,
+        "identity": {"key": "test-station|127.0.0.1:11435|kayock-local"},
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True
+    data = body["data"]
+    assert any(x["parameter"] == "temperature" for x in data["saved"])
+    assert any(x["parameter"] == "context" for x in data["pending"])
+
+    # Preview with_restart without confirm — must not mutate args
+    r2 = client.post("/api/mcc/settings/apply", json={
+        "mode": "with_restart",
+        "engine": "llama-server",
+        "configured_args": "-m /m.gguf -c 4096 -ngl 0 --keep-extra",
+        "pending": {"context": 8192, "gpu_layers": 5},
+        "model": "kayock-local",
+        "server_id": "ls1",
+        "is_self": True,
+        "confirm_restart": False,
+        "do_restart": False,
+        "identity": {"key": "test-station|127.0.0.1:11435|kayock-local"},
+    })
+    assert r2.status_code == 200
+    d2 = r2.get_json()["data"]
+    assert d2.get("needs_confirm") is True
+    assert "--keep-extra" in (d2.get("new_args") or "")
+    # File unchanged
+    saved_cfg = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "-c 4096" in saved_cfg[0]["args"]
+
+    # Apply args without restart
+    r3 = client.post("/api/mcc/settings/apply", json={
+        "mode": "with_restart",
+        "engine": "llama-server",
+        "pending": {"context": 8192, "gpu_layers": 5},
+        "model": "kayock-local",
+        "server_id": "ls1",
+        "is_self": True,
+        "confirm_restart": True,
+        "do_restart": False,
+        "identity": {"key": "test-station|127.0.0.1:11435|kayock-local"},
+    })
+    assert r3.status_code == 200
+    saved_cfg = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "8192" in saved_cfg[0]["args"]
+    assert "--keep-extra" in saved_cfg[0]["args"]
+
+    r4 = client.post("/api/mcc/profiles/sync", json={})
+    assert r4.status_code == 200
+    assert "summary" in r4.get_json()["data"]
+
+    r5 = client.post("/api/mcc/setup/preview", json={
+        "model": "x", "machine": "test", "engine": "ollama",
+        "configured": False, "is_self": True, "allow_control": True,
+        "server_key": "127.0.0.1:11434",
+        "management_status": {"code": "setup_required", "manageable": False},
+        "capabilities": capabilities_for("ollama"),
+    })
+    assert r5.status_code == 200
+    assert r5.get_json()["data"]["applies_changes"] is False
 
 
 def test_mcc_api_capabilities_and_profiles(tmp_path, monkeypatch):
