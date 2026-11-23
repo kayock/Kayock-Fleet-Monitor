@@ -478,6 +478,14 @@ class FleetManager:
                     "peer_count": len(self._peers)}
 
     # -- snapshot -------------------------------------------------------------
+    def request_poll(self):
+        """Ask the poller to refresh peer snapshots on the next loop tick."""
+        self._next_poll = 0.0
+
+    def poll_now(self):
+        """Synchronously refresh peer /metrics caches (for post-adopt verify)."""
+        self._poll_all()
+
     def detail(self, machine_id):
         with self._lock:
             s = self._status.get(machine_id)

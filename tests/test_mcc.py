@@ -11,9 +11,11 @@ from mcc import (
     ProfileStore,
     attach_profiles_to_cards,
     build_model_cards,
+    build_server_inventory,
     capabilities_for,
     classify_pending_for_apply,
     estimate_memory_warning,
+    fleet_setup_preview,
     guess_association,
     management_setup_preview,
     management_status,
@@ -22,6 +24,7 @@ from mcc import (
     preview_apply_profile,
     settings_view,
     stable_model_identity,
+    stable_server_identity,
 )
 
 
@@ -361,6 +364,13 @@ def test_management_status_and_setup():
     )
     assert ms["code"] == "setup_required"
     assert ms["needs_setup"] is True
+    # Unconfigured remote still setup_required (not remote_control first)
+    remote_unreg = management_status(
+        configured=False, is_self=False, allow_control=False,
+        caps=capabilities_for("ollama"),
+        server_caps={}, server_status="online",
+    )
+    assert remote_unreg["code"] == "setup_required"
     remote = management_status(
         configured=True, is_self=False, allow_control=False,
         caps=capabilities_for("ollama"),
@@ -368,6 +378,7 @@ def test_management_status_and_setup():
         server_status="online",
     )
     assert remote["code"] == "remote_control_disabled"
+    assert remote["needs_setup"] is False
     card = {
         "model": "phi", "machine": "Windows", "engine": "ollama",
         "configured": False, "is_self": True, "allow_control": True,
@@ -377,7 +388,7 @@ def test_management_status_and_setup():
     }
     preview = management_setup_preview(card)
     assert preview["applies_changes"] is False
-    assert any(a["action"] == "adopt_server" for a in preview["proposed_actions"])
+    assert any(a["action"] == "register_server" for a in preview["proposed_actions"])
 
 
 def test_merge_startup_args_preserves_unknown():
@@ -621,3 +632,242 @@ def test_fleet_control_get_models_whitelist(tmp_path):
         mid2, "/api/ai/servers/abc/load", {"model": "x"}, method="POST")
     assert status2 == 403
     assert "disabled" in data2["message"]
+
+
+def _ollama_server(**kw):
+    base = {
+        "id": None, "key": "127.0.0.1:11434", "name": "ollama", "type": "ollama",
+        "status": "online", "configured": False,
+        "capabilities": {"can_load": False, "can_unload": False,
+                         "can_start": False, "can_stop": False, "can_restart": False},
+        "loaded_models": [],
+        "installed_models": ["m1", "m2", "m3"],
+        "host": "127.0.0.1", "port": 11434, "url": "http://127.0.0.1:11434",
+    }
+    base.update(kw)
+    return base
+
+
+def test_stable_server_identity_and_inventory_dedupe():
+    a = stable_server_identity(
+        machine="Station", machine_id="st",
+        server={"id": None, "key": "127.0.0.1:11434", "host": "127.0.0.1",
+                "port": 11434, "type": "ollama"},
+    )
+    b = stable_server_identity(
+        machine="Portable", machine_id="pt",
+        server={"id": None, "key": "127.0.0.1:11434", "host": "127.0.0.1",
+                "port": 11434, "type": "ollama"},
+    )
+    assert a["key"] != b["key"]
+    cards = build_model_cards(
+        machine="Station", machine_id=None, allow_control=True, is_self=True,
+        servers=[_ollama_server()],
+    )
+    inv = build_server_inventory(cards)
+    assert len(inv) == 1
+    assert inv[0]["model_count"] == 3
+    assert inv[0]["eligible_for_registration"] is True
+    assert inv[0]["setup_required"] is True
+
+
+def test_fleet_setup_preview_groups_models_not_per_model_servers():
+    local = build_model_cards(
+        machine="Station", machine_id=None, allow_control=True, is_self=True,
+        servers=[_ollama_server()],
+    )
+    peer = build_model_cards(
+        machine="Portable", machine_id="port1", allow_control=True, is_self=False,
+        servers=[_ollama_server()],
+    )
+    win = build_model_cards(
+        machine="Windows", machine_id="win1", allow_control=True, is_self=False,
+        servers=[{
+            "id": "ls1", "key": "127.0.0.1:8080", "name": "llama", "type": "llama-server",
+            "status": "online", "configured": True, "ready": True,
+            "capabilities": {"can_load": False, "can_unload": False,
+                             "can_start": True, "can_stop": True, "can_restart": True},
+            "model_name": "qwen", "loaded_models": [{"name": "qwen"}],
+            "host": "127.0.0.1", "port": 8080,
+        }],
+    )
+    preview = fleet_setup_preview(local + peer + win)
+    assert preview["applies_changes"] is False
+    assert preview["summary"]["servers_discovered"] == 3
+    assert preview["summary"]["servers_registered"] == 1
+    assert preview["summary"]["servers_eligible"] == 2
+    assert len(preview["proposed_registrations"]) == 2
+    assert preview["summary"]["models_discovered"] >= 7
+    assert all(p["action"] == "register_server" for p in preview["proposed_registrations"])
+
+
+def test_adopt_server_idempotent_preserves_config(tmp_path):
+    from ai import AIManager
+    cfg = tmp_path / "ai_servers.json"
+    mgr = AIManager(config_path=str(cfg), discovery_interval=9999)
+    with mgr._lock:
+        mgr._records = [{
+            "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+            "type": "ollama", "name": "ollama", "status": "online",
+        }]
+    ok, msg, warnings = mgr.adopt_server("127.0.0.1:11434")
+    assert ok, msg
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert len(saved) == 1
+    saved[0]["args"] = "--keep-me"
+    saved[0]["exe"] = "/usr/bin/ollama"
+    cfg.write_text(json.dumps(saved), encoding="utf-8")
+    mgr._load_config()
+    with mgr._lock:
+        mgr._records = [{
+            "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+            "type": "ollama", "name": "ollama", "status": "online",
+        }]
+    ok2, msg2, _ = mgr.adopt_server("127.0.0.1:11434")
+    assert ok2 and "already" in msg2
+    saved2 = json.loads(cfg.read_text(encoding="utf-8"))
+    assert len(saved2) == 1
+    assert saved2[0]["args"] == "--keep-me"
+    assert saved2[0]["exe"] == "/usr/bin/ollama"
+
+
+def test_fleet_setup_apply_local_and_remote_permission(tmp_path, monkeypatch):
+    from app import create_app
+    from sampler import SystemSampler
+    from ai import AIManager
+    from fleet import FleetManager
+
+    real_init = ProfileStore.__init__
+
+    def _init(self, path=None):
+        real_init(self, path=str(tmp_path / "model_profiles.json"))
+
+    monkeypatch.setattr(ProfileStore, "__init__", _init)
+
+    ai = AIManager(config_path=str(tmp_path / "ai_servers.json"),
+                   discovery_interval=9999)
+    with ai._lock:
+        ai._records = [{
+            "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+            "type": "ollama", "name": "ollama", "status": "online",
+            "installed_models": ["m1"], "loaded_models": [],
+        }]
+
+    calls = []
+
+    def fake_fetch(url, timeout):
+        calls.append(("GET", url))
+        if url.endswith("/metrics"):
+            return 200, json.dumps({
+                "ai_servers": {
+                    "servers": [{
+                        "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+                        "type": "ollama", "status": "online", "configured": True,
+                        "id": "remote1", "installed_models": ["m1"],
+                        "capabilities": {"can_load": True, "can_unload": True},
+                    }],
+                    "config": [{
+                        "id": "remote1", "host": "127.0.0.1", "port": 11434,
+                        "type": "ollama", "name": "ollama", "args": "", "exe": "",
+                    }],
+                }
+            }), None
+        return 200, "{}", None
+
+    def fake_post(url, payload, timeout):
+        calls.append(("POST", url, payload))
+        if url.endswith("/adopt"):
+            return 200, json.dumps({"ok": True, "message": "added",
+                                    "data": {"warnings": []}}), None
+        if url.endswith("/discovery/refresh"):
+            return 200, json.dumps({"ok": True}), None
+        return 200, json.dumps({"ok": True}), None
+
+    fm = FleetManager(
+        config_path=str(tmp_path / "fleet.json"),
+        fetch=fake_fetch, post=fake_post, discovery_enabled=False,
+    )
+    fm.save_machine({
+        "name": "Portable", "host": "10.0.0.45", "port": 5001,
+        "allow_control": True,
+    })
+    fm.save_machine({
+        "name": "Locked", "host": "10.0.0.99", "port": 5001,
+        "allow_control": False,
+    })
+    mid = [m for m in fm.list_machines() if m["name"] == "Portable"][0]["id"]
+    locked = [m for m in fm.list_machines() if m["name"] == "Locked"][0]["id"]
+    with fm._lock:
+        fm._status[mid] = {
+            "id": mid, "name": "Portable", "online": True, "allow_control": True,
+            "detail": {"ai_servers": {
+                "servers": [{
+                    "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+                    "type": "ollama", "status": "online", "configured": False,
+                    "installed_models": ["peer-m1"], "capabilities": {},
+                }],
+                "config": [],
+            }},
+        }
+        fm._status[locked] = {
+            "id": locked, "name": "Locked", "online": True, "allow_control": False,
+            "detail": {"ai_servers": {
+                "servers": [{
+                    "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
+                    "type": "ollama", "status": "online", "configured": False,
+                    "installed_models": ["x"], "capabilities": {},
+                }],
+                "config": [],
+            }},
+        }
+
+    app = create_app(
+        sampler=SystemSampler(), ai_manager=ai, fleet_manager=fm,
+        start_sampler=False, start_ai=False, start_fleet=False,
+        self_port=5000, machine_label="Station",
+    )
+    client = app.test_client()
+
+    prev = client.get("/api/mcc/fleet-setup/preview")
+    assert prev.status_code == 200
+    pdata = prev.get_json()["data"]
+    assert pdata["summary"]["servers_discovered"] >= 2
+    eligible = [s for s in pdata["servers"] if s["eligible_for_registration"]]
+    assert any(s["is_self"] for s in eligible)
+    assert any(s["machine"] == "Portable" for s in eligible)
+    assert all(
+        (s["machine"] != "Locked") or (not s["eligible_for_registration"])
+        for s in pdata["servers"])
+
+    bad = client.post("/api/mcc/fleet-setup/apply",
+                      json={"servers": [eligible[0]["id"]]})
+    assert bad.status_code == 400
+
+    local = next(s for s in eligible if s["is_self"])
+    remote = next(s for s in eligible if s["machine"] == "Portable")
+    applied = client.post("/api/mcc/fleet-setup/apply", json={
+        "confirm": True,
+        "servers": [local["id"], remote["id"]],
+    })
+    body = applied.get_json()
+    assert body["data"]["inference_changed"] is False
+    assert any(r["ok"] for r in body["data"]["results"])
+    local_cfg = json.loads((tmp_path / "ai_servers.json").read_text(encoding="utf-8"))
+    assert any(int(c.get("port") or 0) == 11434 for c in local_cfg)
+    assert any(c[0] == "POST" and "/adopt" in c[1] for c in calls)
+
+    locked_srv = next(s for s in pdata["servers"] if s["machine"] == "Locked")
+    denied = client.post("/api/mcc/fleet-setup/apply", json={
+        "confirm": True, "servers": [locked_srv["id"]],
+    })
+    assert denied.get_json()["data"]["results"][0]["ok"] is False
+
+    with ai._lock:
+        ai._records[0]["installed_models"] = ["m1", "m2"]
+    cards = build_model_cards(
+        machine="Station", machine_id=None, allow_control=True, is_self=True,
+        servers=ai.snapshot()["servers"],
+    )
+    assert any(c.get("configured") for c in cards)
+    assert any((c.get("management_status") or {}).get("manageable")
+               for c in cards if c.get("model"))

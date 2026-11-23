@@ -1492,9 +1492,12 @@
     query: "",
     filter: "all",
     cards: [],
+    servers: [],
+    managementSummary: null,
     profiles: [],
     selectedCard: null,
     pending: {},
+    fleetPreview: null,
   };
 
   function mccControlUrl(card, action) {
@@ -1514,13 +1517,19 @@
     ]).then(function (pair) {
       var inv = pair[0]; var prof = pair[1];
       state.mcc.cards = (inv.data && inv.data.cards) || [];
+      state.mcc.servers = (inv.data && inv.data.servers) || [];
+      state.mcc.managementSummary = (inv.data && inv.data.management_summary) || null;
       state.mcc.profiles = (prof.data && prof.data.profiles) || [];
       state.mcc.templates = (prof.data && prof.data.templates) || [];
       renderMCCFilters();
       renderMCCProfiles();
+      renderMCCSummary();
       renderMCCCards();
       if (chip) {
-        chip.textContent = state.mcc.cards.length + " model card(s)";
+        var s = state.mcc.managementSummary || {};
+        chip.textContent = (state.mcc.cards.length) + " model(s) · "
+          + (s.servers_discovered != null ? s.servers_discovered : (state.mcc.servers || []).length)
+          + " server(s)";
         chip.className = "status-chip ok";
       }
     }).catch(function (err) {
@@ -1557,6 +1566,25 @@
       opts.push('<option value="' + esc(p.id) + '">' + esc(label) + '</option>');
     });
     sel.innerHTML = opts.join("");
+  }
+
+  function renderMCCSummary() {
+    var panel = document.getElementById("mcc-mgmt-summary");
+    if (!panel) return;
+    var s = state.mcc.managementSummary;
+    if (!s) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var attn = (s.machines_needing_attention || []).map(function (a) {
+      return esc(a.machine) + " (" + esc(a.reason) + ")";
+    }).join("; ");
+    panel.innerHTML = "<b>Management summary</b> — servers discovered: " + esc(s.servers_discovered)
+      + ", registered: " + esc(s.servers_registered)
+      + ", needing setup: " + esc(s.servers_requiring_setup)
+      + " · models: " + esc(s.models_discovered)
+      + ", manageable: " + esc(s.models_manageable)
+      + ", needs setup: " + esc(s.models_needing_setup)
+      + (attn ? "<br><span class='mini'>Machines needing attention: " + attn + "</span>" : "")
+      + "<br><span class='mini'>Register servers once via Configure Fleet Management — not once per model.</span>";
   }
 
   function filteredMCCCards() {
@@ -1633,7 +1661,7 @@
       var btns = [];
       var ms = c.management_status || {};
       if (ms.needs_setup) {
-        btns.push('<button class="btn" data-mcc-act="setup" data-cid="' + esc(c.id) + '">Set Up Management</button>');
+        btns.push('<button class="btn" data-mcc-act="fleet-setup" data-cid="' + esc(c.id) + '">Setup required — configure server</button>');
       }
       if (c.actions.load) btns.push('<button class="btn" data-mcc-act="load" data-cid="' + esc(c.id) + '">Load</button>');
       if (c.actions.unload) btns.push('<button class="btn danger" data-mcc-act="unload" data-cid="' + esc(c.id) + '">Unload</button>');
@@ -1967,35 +1995,8 @@
       });
       return;
     }
-    if (act === "setup") {
-      postJSON("/api/mcc/setup/preview", { card: card }).then(function (r) {
-        var d = (r.body && r.body.data) || {};
-        var lines = (d.explanation || []).concat(
-          (d.proposed_actions || []).map(function (a) {
-            return "→ " + a.label + (a.automatic ? " (can apply here)" : " (manual)");
-          })
-        );
-        window.alert("Set Up Management\n\n"
-          + (d.friendly_name || d.model || "") + " on " + (d.machine || "")
-          + "\nEngine: " + (d.engine || "") + "\n"
-          + "Status: " + ((d.current_status && d.current_status.label) || "") + "\n\n"
-          + lines.join("\n") + "\n\n" + (d.note || ""));
-        var actions = d.proposed_actions || [];
-        var auto = actions.filter(function (a) { return a.automatic || a.action === "enable_allow_control"; });
-        if (!auto.length) return;
-        if (!window.confirm("Apply the first available setup action now?\n" + auto[0].label)) return;
-        var a0 = auto[0];
-        postJSON("/api/mcc/setup/apply", {
-          action: a0.action,
-          confirm: true,
-          server_key: a0.server_key || card.server_key,
-          machine_id: card.machine_id,
-          is_self: !!card.is_self,
-        }).then(function (r2) {
-          showResult(r2);
-          setTimeout(refreshMCC, 1000);
-        });
-      });
+    if (act === "setup" || act === "fleet-setup") {
+      openMCCFleetSetup(card && card.server_key ? card.server_key : null);
       return;
     }
     if (!card.server_id && act !== "setup") {
@@ -2077,6 +2078,122 @@
     }
   }
 
+  function openMCCFleetSetup(preselectServerKey) {
+    var body = document.getElementById("mcc-fleet-modal-body");
+    if (!body) return;
+    body.innerHTML = '<p class="note">Loading fleet servers…</p>';
+    openModal("mcc-fleet-modal");
+    fetch("/api/mcc/fleet-setup/preview", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var d = (res && res.data) || {};
+        state.mcc.fleetPreview = d;
+        var s = d.summary || {};
+        var html = '<p class="note">' + esc(d.note || "") + '</p>';
+        html += '<div class="mcc-kv">'
+          + '<div><span>Servers discovered</span><b>' + esc(s.servers_discovered) + '</b></div>'
+          + '<div><span>Registered</span><b>' + esc(s.servers_registered) + '</b></div>'
+          + '<div><span>Eligible now</span><b>' + esc(s.servers_eligible) + '</b></div>'
+          + '<div><span>Models / manageable</span><b>' + esc(s.models_discovered) + " / " + esc(s.models_manageable) + '</b></div>'
+          + '</div>';
+        html += '<p class="mini"><b>Model management</b> = load/unload via backend API. '
+          + '<b>Process management</b> = start/stop/restart (requires a known executable). '
+          + "Registration alone does not start, stop, load, or unload anything.</p>";
+        html += '<table class="mcc-table" style="width:100%;font-size:0.9em"><thead><tr>'
+          + '<th></th><th>Machine</th><th>Engine</th><th>Endpoint</th><th>Models</th>'
+          + '<th>Status</th><th>Registered</th><th>Remote control</th><th>Setup</th>'
+          + '</tr></thead><tbody>';
+        (d.servers || []).forEach(function (srv) {
+          var eligible = !!srv.eligible_for_registration;
+          var checked = eligible && (
+            !preselectServerKey || preselectServerKey === srv.server_key);
+          html += '<tr>'
+            + '<td>' + (eligible
+              ? '<input type="checkbox" data-mcc-fleet-sel="' + esc(srv.id) + '"'
+                + (checked ? " checked" : "") + '>'
+              : "") + '</td>'
+            + '<td>' + esc(srv.machine) + (srv.is_self ? " (local)" : "") + '</td>'
+            + '<td>' + esc(srv.engine_label || srv.engine) + '</td>'
+            + '<td class="ellip">' + esc(srv.endpoint || srv.server_key || "—") + '</td>'
+            + '<td>' + esc(srv.model_count) + (srv.loaded_count ? " (" + esc(srv.loaded_count) + " loaded)" : "") + '</td>'
+            + '<td>' + esc(srv.status || "—") + '</td>'
+            + '<td>' + (srv.configured ? "Yes" : "No") + '</td>'
+            + '<td>' + (srv.is_self ? "local" : (srv.allow_control ? "Enabled" : "Disabled")) + '</td>'
+            + '<td>' + esc(srv.setup_explanation || "") + '</td>'
+            + '</tr>';
+          html += '<tr><td></td><td colspan="8" class="mini">'
+            + "Supported: "
+            + (srv.supported_actions && srv.supported_actions.load ? "Load " : "")
+            + (srv.supported_actions && srv.supported_actions.unload ? "Unload " : "")
+            + (srv.supported_actions && srv.supported_actions.start ? "Start " : "")
+            + (srv.supported_actions && srv.supported_actions.stop ? "Stop " : "")
+            + (srv.supported_actions && srv.supported_actions.restart ? "Restart " : "")
+            + (srv.supported_actions && srv.supported_actions.switch_via_restart ? "SwitchViaRestart " : "")
+            + "· model-mgmt capability: " + (srv.model_management ? "yes" : "engine-dependent after register")
+            + " · process-mgmt: " + (srv.process_management ? "yes" : "needs exe after register")
+            + (srv.models && srv.models.length
+              ? " · models: " + esc(srv.models.slice(0, 8).join(", "))
+                + (srv.models.length > 8 ? "…" : "")
+              : "")
+            + '</td></tr>';
+        });
+        html += '</tbody></table>';
+        if ((s.machines_needing_attention || []).length) {
+          html += '<p class="note">Remote control is disabled for: '
+            + (s.machines_needing_attention || []).map(function (a) {
+              return esc(a.machine);
+            }).join(", ")
+            + ". Enable it separately in Fleet machine Configure — this wizard will not turn it on.</p>";
+        }
+        body.innerHTML = html;
+      })
+      .catch(function (err) {
+        body.innerHTML = '<p class="note">Failed to load fleet setup: '
+          + esc(err && err.message ? err.message : String(err)) + '</p>';
+      });
+  }
+
+  function applyMCCFleetSetup() {
+    var body = document.getElementById("mcc-fleet-modal-body");
+    if (!body) return;
+    var selected = [];
+    body.querySelectorAll("[data-mcc-fleet-sel]:checked").forEach(function (el) {
+      selected.push(el.getAttribute("data-mcc-fleet-sel"));
+    });
+    if (!selected.length) {
+      window.alert("Select at least one eligible server to register.");
+      return;
+    }
+    var preview = state.mcc.fleetPreview || {};
+    var lines = selected.map(function (id) {
+      var s = ((preview.servers || []).filter(function (x) { return x.id === id; })[0]) || {};
+      return (s.machine || "?") + " · " + (s.engine || "?") + " · " + (s.endpoint || s.server_key || id)
+        + " (" + (s.model_count || 0) + " models) → " + (s.is_self ? "local ai_servers.json" : "peer config via allow_control");
+    });
+    if (!window.confirm(
+      "Register these inference servers?\n\n"
+      + lines.join("\n")
+      + "\n\nThis writes Fleet Monitor management configuration only.\n"
+      + "It will NOT start, stop, restart, load, or unload any models."
+    )) return;
+    postJSON("/api/mcc/fleet-setup/apply", {
+      confirm: true,
+      servers: selected,
+    }).then(function (r) {
+      var data = (r.body && r.body.data) || {};
+      var results = data.results || [];
+      var msg = (r.body && r.body.message ? r.body.message + "\n\n" : "")
+        + results.map(function (x) {
+          return (x.ok ? "✓ " : "✗ ") + (x.machine || "") + " " + (x.engine || "")
+            + ": " + (x.message || "")
+            + (x.verified === false ? " (not yet verified)" : "");
+        }).join("\n");
+      window.alert(msg || "Done.");
+      closeModal("mcc-fleet-modal");
+      setTimeout(refreshMCC, 1200);
+    });
+  }
+
   function bindMCC() {
     document.querySelectorAll(".mcc-mode").forEach(function (btn) {
       btn.addEventListener("click", function () {
@@ -2089,6 +2206,14 @@
     });
     var refresh = document.getElementById("mcc-refresh");
     if (refresh) refresh.addEventListener("click", refreshMCC);
+    var fleetBtn = document.getElementById("mcc-fleet-setup");
+    if (fleetBtn) fleetBtn.addEventListener("click", function () { openMCCFleetSetup(null); });
+    ["mcc-fleet-modal-close", "mcc-fleet-modal-cancel"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener("click", function () { closeModal("mcc-fleet-modal"); });
+    });
+    var fleetApply = document.getElementById("mcc-fleet-modal-apply");
+    if (fleetApply) fleetApply.addEventListener("click", applyMCCFleetSetup);
     var search = document.getElementById("mcc-search");
     if (search) search.addEventListener("input", function () {
       state.mcc.query = search.value || "";

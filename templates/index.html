@@ -124,10 +124,10 @@
         </div>
       </div>
       <p class="note" id="mcc-intro">
-        Manage models across your fleet. Sync builds persistent profiles from discovery.
-        Simple Mode keeps everyday controls clear; Advanced and Expert disclose engine-specific settings.
-        Nothing loads, unloads, or restarts until you confirm.
+        Manage models across your fleet. Register each inference server once — its models inherit capabilities.
+        Sync builds persistent profiles. Nothing loads, unloads, or restarts until you confirm.
       </p>
+      <div id="mcc-mgmt-summary" class="mcc-profile-panel note" hidden></div>
       <div class="mcc-toolbar">
         <div class="sort-tabs" id="mcc-machine-filters">
           <button type="button" class="tab active" data-mcc-machine="all">All machines</button>
@@ -145,6 +145,7 @@
         <select id="mcc-profile-select" class="ai-model-select" title="Saved profiles">
           <option value="">— profile —</option>
         </select>
+        <button type="button" class="btn" id="mcc-fleet-setup">Configure Fleet Management</button>
         <button type="button" class="btn small" id="mcc-sync-profiles">Sync Model Profiles</button>
         <button type="button" class="btn small" id="mcc-profile-preview">Preview profile</button>
         <button type="button" class="btn small" id="mcc-profile-new">New profile</button>
@@ -177,6 +178,21 @@
         <button class="tab" id="mcc-modal-save-profile" type="button">Save Profile</button>
         <button class="tab" id="mcc-modal-apply-supported" type="button">Apply Supported Changes</button>
         <button class="tab" id="mcc-modal-apply-restart" type="button">Apply With Restart</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fleet-wide management setup wizard -->
+  <div class="modal-overlay" id="mcc-fleet-modal" hidden>
+    <div class="modal mcc-modal" style="max-width:920px">
+      <div class="modal-head">
+        <h3 id="mcc-fleet-modal-title">Configure Fleet Management</h3>
+        <button class="tab" id="mcc-fleet-modal-close" type="button">✕</button>
+      </div>
+      <div class="modal-body" id="mcc-fleet-modal-body"></div>
+      <div class="modal-foot">
+        <button class="tab" id="mcc-fleet-modal-cancel" type="button">Cancel</button>
+        <button class="tab" id="mcc-fleet-modal-apply" type="button">Configure Selected Servers</button>
       </div>
     </div>
   </div>

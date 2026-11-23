@@ -80,14 +80,15 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 - `ai_servers.json` — your configured AI servers (created on first save).
 - `fleet.json` — fleet machines incl. the per-machine `allow_control` flag.
 
-### Model Control Center (v3.2.1)
+### Model Control Center (v3.2.2)
 
 Fleet-wide model cards with Simple / Advanced / Expert modes, remote
 load/unload (when `allow_control` is enabled), profiles, and pending-vs-active
 settings previews — without silently rewriting launch arguments.
 
 - Docs: [`docs/MODEL_CONTROL_CENTER.md`](docs/MODEL_CONTROL_CENTER.md)
-- Open the **Model Control** tab after upgrading to 3.2.1+
+- Open the **Model Control** tab after upgrading to 3.2.2+
+- Use **Configure Fleet Management** to register each inference server once
 - Use **Sync Model Profiles** for automatic per-installation profiles (non-destructive)
 - See [docs/MODEL_CONTROL_CENTER.md](docs/MODEL_CONTROL_CENTER.md) for Apply / Setup / Protected behavior
 

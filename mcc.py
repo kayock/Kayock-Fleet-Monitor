@@ -475,24 +475,29 @@ def default_friendly_name(model: str | None, machine: str) -> str:
 def management_status(*, configured: bool, is_self: bool, allow_control: bool,
                       caps: dict, server_caps: dict,
                       server_status: str | None) -> dict:
-    """Clear why a model can/cannot be managed."""
-    if server_status in ("offline", "error") or server_status is None and not configured:
-        # still classify setup needs below
-        pass
+    """Clear why a model can/cannot be managed.
+
+    Registration (configured) is checked before remote-control authorization so
+    unregistered peers correctly show Setup required rather than only
+    remote-control messaging.
+    """
+    if not configured:
+        detail = "Server is discovered but not registered for management."
+        if not is_self and not allow_control:
+            detail += " Remote registration also requires Allow remote control."
+        return {
+            "code": "setup_required",
+            "label": "Setup required",
+            "detail": detail,
+            "needs_setup": True,
+            "manageable": False,
+        }
     if not is_self and not allow_control:
         return {
             "code": "remote_control_disabled",
             "label": "Remote control disabled",
-            "detail": "Enable Allow remote control on this fleet machine first.",
-            "needs_setup": True,
-            "manageable": False,
-        }
-    if not configured:
-        return {
-            "code": "setup_required",
-            "label": "Setup required",
-            "detail": "Server is discovered but not adopted/configured for management.",
-            "needs_setup": True,
+            "detail": "Server is registered, but Allow remote control is off for this machine.",
+            "needs_setup": False,
             "manageable": False,
         }
     if server_status in ("offline",):
@@ -503,14 +508,20 @@ def management_status(*, configured: bool, is_self: bool, allow_control: bool,
             "needs_setup": False,
             "manageable": False,
         }
-    can_manage = any([
+    # Model-management vs process-management are separate.
+    model_mgmt = any([
         server_caps.get("can_load") and caps.get("can_load"),
         server_caps.get("can_unload") and caps.get("can_unload"),
+    ])
+    process_mgmt = any([
         server_caps.get("can_start"),
         server_caps.get("can_stop"),
         server_caps.get("can_restart"),
-        caps.get("model_switch") == "restart_with_model" and server_caps.get("can_restart"),
     ])
+    switch_via_restart = (
+        caps.get("model_switch") == "restart_with_model"
+        and server_caps.get("can_restart"))
+    can_manage = bool(model_mgmt or process_mgmt or switch_via_restart)
     if not can_manage and not (caps.get("can_load") or caps.get("can_unload")
                                or caps.get("model_switch") == "restart_with_model"):
         return {
@@ -527,50 +538,268 @@ def management_status(*, configured: bool, is_self: bool, allow_control: bool,
             "detail": "Authorized management actions are available.",
             "needs_setup": False,
             "manageable": True,
+            "model_management": bool(model_mgmt or switch_via_restart),
+            "process_management": bool(process_mgmt),
         }
     return {
         "code": "monitoring_only",
         "label": "Monitoring only",
-        "detail": "Server is configured but no model-management actions are available.",
+        "detail": "Server is registered but no model-management actions are available "
+                  "(process control may still require an executable path).",
         "needs_setup": False,
         "manageable": False,
     }
 
 
+def stable_server_identity(*, machine: str, machine_id: str | None,
+                           server: dict) -> dict:
+    """Stable per-server identity — not display-name based."""
+    host = server.get("host") or server.get("lan_host") or ""
+    port = server.get("port")
+    sid = server.get("id") or ""
+    skey = server.get("key") or (f"{host}:{port}" if host and port else "")
+    mid = (machine_id or machine or "").strip()
+    engine = (server.get("type") or server.get("api_type") or server.get("engine")
+              or "unknown")
+    key = f"{mid}|{skey}|{engine}"
+    return {
+        "key": key,
+        "machine": machine,
+        "machine_id": machine_id,
+        "server_id": sid or None,
+        "server_key": skey or None,
+        "engine": engine,
+        "host": host,
+        "port": port,
+        "endpoint": server.get("url") or (
+            f"http://{host}:{port}" if host and port else None),
+    }
+
+
+def build_server_inventory(cards: list[dict]) -> list[dict]:
+    """Collapse model cards into one row per inference server."""
+    by: dict[str, dict] = {}
+    for c in cards or []:
+        skey = c.get("server_key") or c.get("server_id") or c.get("endpoint") or "_"
+        mid = c.get("machine_id") or c.get("machine") or ""
+        engine = c.get("engine") or "unknown"
+        ident_key = f"{mid}|{skey}|{engine}"
+        row = by.get(ident_key)
+        if not row:
+            scaps = c.get("server_capabilities") or {}
+            caps = c.get("capabilities") or {}
+            row = {
+                "id": ident_key,
+                "identity": {
+                    "key": ident_key,
+                    "machine": c.get("machine"),
+                    "machine_id": c.get("machine_id"),
+                    "server_key": c.get("server_key"),
+                    "server_id": c.get("server_id"),
+                    "engine": engine,
+                    "endpoint": c.get("endpoint"),
+                },
+                "machine": c.get("machine"),
+                "machine_id": c.get("machine_id"),
+                "is_self": bool(c.get("is_self")),
+                "allow_control": bool(c.get("allow_control")),
+                "engine": engine,
+                "engine_label": c.get("engine_label") or engine,
+                "endpoint": c.get("endpoint"),
+                "server_key": c.get("server_key"),
+                "server_id": c.get("server_id"),
+                "server_name": c.get("server_name"),
+                "status": c.get("status"),
+                "configured": bool(c.get("configured")),
+                "management_status": c.get("management_status"),
+                "model_count": 0,
+                "models": [],
+                "loaded_count": 0,
+                "supported_actions": {
+                    "load": bool(caps.get("can_load")),
+                    "unload": bool(caps.get("can_unload")),
+                    "start": bool(scaps.get("can_start")),
+                    "stop": bool(scaps.get("can_stop")),
+                    "restart": bool(scaps.get("can_restart")),
+                    "switch_via_restart": caps.get("model_switch") == "restart_with_model",
+                },
+                "model_management": bool(caps.get("can_load") or caps.get("can_unload")),
+                "process_management": bool(
+                    scaps.get("can_start") or scaps.get("can_stop") or scaps.get("can_restart")),
+                "eligible_for_registration": (
+                    not bool(c.get("configured"))
+                    and bool(c.get("server_key"))
+                    and (bool(c.get("is_self")) or bool(c.get("allow_control")))
+                ),
+                "registration_blocked_reason": None,
+            }
+            if not c.get("server_key"):
+                row["registration_blocked_reason"] = "Missing discovery server key."
+            elif not c.get("is_self") and not c.get("allow_control"):
+                row["registration_blocked_reason"] = (
+                    "Remote control disabled — enable Allow remote control first.")
+                row["eligible_for_registration"] = False
+            elif c.get("configured"):
+                row["registration_blocked_reason"] = "Already registered."
+            by[ident_key] = row
+        if c.get("model"):
+            row["model_count"] += 1
+            row["models"].append(c.get("model"))
+            if c.get("model_status") == "loaded":
+                row["loaded_count"] += 1
+        # Prefer online-ish status if mixed
+        if c.get("status") in ("online", "ready", "busy") and row.get("status") not in (
+                "online", "ready", "busy"):
+            row["status"] = c.get("status")
+        if c.get("configured"):
+            row["configured"] = True
+            row["eligible_for_registration"] = False
+            row["server_id"] = c.get("server_id") or row.get("server_id")
+            row["management_status"] = c.get("management_status")
+    # Deduplicate model lists
+    for row in by.values():
+        seen = set()
+        uniq = []
+        for m in row["models"]:
+            if m not in seen:
+                seen.add(m)
+                uniq.append(m)
+        row["models"] = uniq
+        row["model_count"] = len(uniq)
+        ms = row.get("management_status") or {}
+        row["setup_required"] = bool(ms.get("needs_setup") or not row.get("configured"))
+        row["setup_explanation"] = ms.get("detail") or (
+            "Already registered." if row.get("configured")
+            else "Register this server once to enable management for its models.")
+    return sorted(by.values(), key=lambda r: (
+        0 if r.get("is_self") else 1,
+        r.get("machine") or "",
+        r.get("engine") or "",
+        r.get("endpoint") or "",
+    ))
+
+
+def fleet_setup_preview(cards: list[dict]) -> dict:
+    """Fleet-wide server registration preview — never mutates."""
+    servers = build_server_inventory(cards)
+    eligible = [s for s in servers if s.get("eligible_for_registration")]
+    registered = [s for s in servers if s.get("configured")]
+    needs = [s for s in servers if s.get("setup_required")]
+    attention = []
+    for s in servers:
+        if not s.get("is_self") and not s.get("allow_control"):
+            attention.append({
+                "machine": s.get("machine"),
+                "machine_id": s.get("machine_id"),
+                "reason": "Remote control disabled",
+            })
+    # de-dupe attention by machine
+    seen_m = set()
+    attn_uniq = []
+    for a in attention:
+        k = a.get("machine_id") or a.get("machine")
+        if k in seen_m:
+            continue
+        seen_m.add(k)
+        attn_uniq.append(a)
+    model_cards = [c for c in cards if c.get("model")]
+    manageable_models = [
+        c for c in model_cards
+        if (c.get("management_status") or {}).get("manageable")
+    ]
+    needs_models = [
+        c for c in model_cards
+        if (c.get("management_status") or {}).get("needs_setup")
+    ]
+    proposed = []
+    for s in eligible:
+        proposed.append({
+            "action": "register_server",
+            "server_id": s.get("id"),
+            "machine": s.get("machine"),
+            "machine_id": s.get("machine_id"),
+            "is_self": s.get("is_self"),
+            "allow_control": s.get("allow_control"),
+            "server_key": s.get("server_key"),
+            "engine": s.get("engine"),
+            "endpoint": s.get("endpoint"),
+            "model_count": s.get("model_count"),
+            "writes": (
+                "local ai_servers.json" if s.get("is_self")
+                else f"peer {s.get('machine')} ai_servers.json via allow_control proxy"
+            ),
+            "does_not": [
+                "start/stop/restart inference",
+                "load/unload models",
+                "rewrite launch arguments",
+                "enable allow_control",
+            ],
+            "selected_default": True,
+        })
+    return {
+        "summary": {
+            "servers_discovered": len(servers),
+            "servers_registered": len(registered),
+            "servers_requiring_setup": len(needs),
+            "servers_eligible": len(eligible),
+            "models_discovered": len(model_cards),
+            "models_manageable": len(manageable_models),
+            "models_needing_setup": len(needs_models),
+            "machines_needing_attention": attn_uniq,
+        },
+        "servers": servers,
+        "proposed_registrations": proposed,
+        "applies_changes": False,
+        "note": (
+            "Preview only — nothing was written. Confirm Configure Selected Servers "
+            "to register eligible inference servers once each. Model cards inherit "
+            "capabilities from their server after registration."
+        ),
+    }
+
+
 def management_setup_preview(card: dict) -> dict:
-    """Guided setup preview — never mutates. Caller must confirm before acting."""
+    """Guided setup preview for one card — never mutates. Prefers server-level register."""
     ms = card.get("management_status") or {}
     steps = []
     proposed = []
-    if not card.get("is_self") and not card.get("allow_control"):
-        steps.append("Remote control is disabled for this machine.")
+    if not card.get("configured"):
+        steps.append("Server is discovered but not registered for management.")
+        if card.get("is_self") or card.get("allow_control"):
+            proposed.append({
+                "action": "register_server",
+                "label": "Register this inference server (once for all its models)",
+                "automatic": True,
+                "requires": "server_key",
+                "server_key": card.get("server_key"),
+                "machine_id": card.get("machine_id"),
+                "is_self": bool(card.get("is_self")),
+                "note": (
+                    "Writes Fleet Monitor management config only. Does not start, stop, "
+                    "load, or unload anything. Process control still requires an exe path."
+                ),
+            })
+        if not card.get("is_self") and not card.get("allow_control"):
+            steps.append("Remote control is disabled for this machine.")
+            proposed.append({
+                "action": "enable_allow_control",
+                "label": "Enable Allow remote control on the fleet machine entry",
+                "automatic": False,
+                "where": "Fleet machine Configure → Allow remote control",
+            })
+    elif not card.get("is_self") and not card.get("allow_control"):
+        steps.append("Server is registered, but remote control is disabled.")
         proposed.append({
             "action": "enable_allow_control",
             "label": "Enable Allow remote control on the fleet machine entry",
             "automatic": False,
             "where": "Fleet machine Configure → Allow remote control",
         })
-    if not card.get("configured"):
-        steps.append("Server is discovered but not adopted for management.")
-        if card.get("is_self"):
-            proposed.append({
-                "action": "adopt_server",
-                "label": "Adopt this local server into ai_servers.json",
-                "automatic": True,
-                "requires": "server_key",
-                "server_key": card.get("server_key"),
-                "note": "Only local loopback servers can be adopted; exe path may still be needed for start/stop.",
-            })
-        else:
-            proposed.append({
-                "action": "adopt_on_peer",
-                "label": "Adopt/configure the server on the peer machine itself",
-                "automatic": False,
-                "note": "Adoption is local-only by design — do it on the peer dashboard.",
-            })
     caps = card.get("capabilities") or {}
     if caps.get("model_switch") == "restart_with_model":
-        steps.append("llama-server requires managed restart to switch models (Unload while running is unsupported).")
+        steps.append(
+            "llama-server: model switch uses managed restart when process control "
+            "is available; Unload while leaving the server running is unsupported.")
     if not proposed and ms.get("manageable"):
         steps.append("Already manageable — no setup required.")
     return {
@@ -579,11 +808,12 @@ def management_setup_preview(card: dict) -> dict:
         "machine": card.get("machine"),
         "engine": card.get("engine"),
         "endpoint": card.get("endpoint"),
+        "server_key": card.get("server_key"),
         "current_status": ms,
         "explanation": steps,
         "proposed_actions": proposed,
         "applies_changes": False,
-        "note": "Preview only — nothing was changed. Confirm an action explicitly to proceed.",
+        "note": "Preview only — nothing was changed. Prefer Configure Fleet Management for multi-server setup.",
     }
 
 

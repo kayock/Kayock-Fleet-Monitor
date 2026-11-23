@@ -32,8 +32,9 @@ from flask import Flask, jsonify, render_template, request
 from ai import AIManager
 from fleet import FleetManager
 from mcc import (ProfileStore, attach_profiles_to_cards, build_model_cards,
-                 capabilities_for, classify_pending_for_apply,
-                 estimate_memory_warning, management_setup_preview,
+                 build_server_inventory, capabilities_for,
+                 classify_pending_for_apply, estimate_memory_warning,
+                 fleet_setup_preview, management_setup_preview,
                  merge_startup_args, preview_apply_profile, settings_view)
 from sampler import HISTORY_LEN, REFRESH_SECONDS, SystemSampler
 from utils import utc_now_iso
@@ -42,7 +43,7 @@ _werkzeug_log = logging.getLogger("werkzeug")
 _werkzeug_log.setLevel(logging.WARNING)  # avoid a log line every 2 s poll
 
 APP_NAME = "Kayock Fleet Monitor"
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.2.2"
 
 
 def _json_result(ok, message, data=None, status=200):
@@ -318,10 +319,13 @@ def create_app(sampler: SystemSampler | None = None,
     def mcc_inventory():
         """Fleet-wide model cards built from local + peer cached snapshots."""
         uniq, self_label, local_sys = _mcc_gather_cards()
+        setup = fleet_setup_preview(uniq)
         return jsonify({
             "ok": True,
             "data": {
                 "cards": uniq,
+                "servers": setup.get("servers") or [],
+                "management_summary": setup.get("summary") or {},
                 "self_label": self_label,
                 "profiles_count": len(profile_store.list_profiles()),
                 "ts": local_sys.get("ts") or local_sys.get("collected_at"),
@@ -597,6 +601,167 @@ def create_app(sampler: SystemSampler | None = None,
         )
         return jsonify({"ok": True, "data": warn})
 
+    def _mcc_register_server(*, server_key: str, is_self: bool,
+                             machine_id: str | None = None) -> tuple[bool, str, dict]:
+        """Register (adopt) one discovered server locally or via peer proxy.
+
+        Never starts/stops/loads/unloads. Preserves existing peer/local config.
+        """
+        if not server_key:
+            return False, "server_key is required", {}
+        if is_self or not machine_id:
+            ok, msg, warnings = ai_manager.adopt_server(server_key)
+            # Immediate local verify via snapshot key match
+            snap = ai_manager.snapshot()
+            verified = False
+            server_id = None
+            for s in snap.get("servers") or []:
+                if s.get("key") == server_key and s.get("configured"):
+                    verified = True
+                    server_id = s.get("id")
+                    break
+            for c in snap.get("config") or []:
+                if f"{c.get('host')}:{c.get('port')}" == server_key or c.get("id") == server_id:
+                    server_id = c.get("id")
+                    verified = True
+            return ok and verified, msg if ok else msg, {
+                "warnings": warnings, "verified": verified,
+                "server_id": server_id, "scope": "local",
+                "inference_changed": False,
+            }
+        # Remote — requires existing allow_control; peer writes its own config
+        status, data = fleet_manager.control_request(
+            machine_id,
+            f"/api/ai/servers/{server_key}/adopt",
+            {},
+            method="POST",
+        )
+        if status == 403:
+            return False, (data or {}).get("message") or "remote control denied", {
+                "scope": "remote", "http_status": status, "inference_changed": False,
+            }
+        ok = bool((data or {}).get("ok"))
+        msg = (data or {}).get("message") or f"peer HTTP {status}"
+        # Ask peer to refresh discovery, then refresh our cache and verify
+        fleet_manager.control_request(
+            machine_id, "/api/ai/discovery/refresh", {}, method="POST")
+        try:
+            fleet_manager.poll_now()
+        except Exception:
+            fleet_manager.request_poll()
+        verified = False
+        server_id = None
+        wrap = fleet_manager.detail(machine_id) or {}
+        metrics = wrap.get("detail") if isinstance(wrap.get("detail"), dict) else {}
+        ai = metrics.get("ai_servers") or {}
+        for s in ai.get("servers") or []:
+            if s.get("key") == server_key and s.get("configured"):
+                verified = True
+                server_id = s.get("id")
+                break
+        for c in ai.get("config") or []:
+            if isinstance(c, dict) and (
+                    f"{c.get('host')}:{c.get('port')}" == server_key
+                    or c.get("id") == server_id):
+                verified = True
+                server_id = c.get("id") or server_id
+        if ok and not verified:
+            # Peer accepted but cache may lag — still report partial success
+            return True, msg + " (accepted; verification pending next fleet poll)", {
+                "warnings": ((data or {}).get("data") or {}).get("warnings"),
+                "verified": False, "server_id": server_id, "scope": "remote",
+                "http_status": status, "inference_changed": False,
+            }
+        return ok and verified, msg, {
+            "warnings": ((data or {}).get("data") or {}).get("warnings"),
+            "verified": verified, "server_id": server_id, "scope": "remote",
+            "http_status": status, "inference_changed": False,
+        }
+
+    @app.route("/api/mcc/fleet-setup/preview", methods=["GET", "POST"])
+    def mcc_fleet_setup_preview():
+        cards, self_label, _ = _mcc_gather_cards()
+        data = fleet_setup_preview(cards)
+        data["self_label"] = self_label
+        return jsonify({"ok": True, "data": data})
+
+    @app.route("/api/mcc/fleet-setup/apply", methods=["POST"])
+    def mcc_fleet_setup_apply():
+        """Register explicitly selected servers. No inference process changes."""
+        body = request.get_json(silent=True) or {}
+        if not bool(body.get("confirm")):
+            return _json_result(False, "confirm=true is required", status=400)
+        selections = body.get("servers") or body.get("selected") or []
+        if not isinstance(selections, list) or not selections:
+            return _json_result(False, "servers list is required")
+        cards, _, _ = _mcc_gather_cards()
+        preview = fleet_setup_preview(cards)
+        by_id = {s["id"]: s for s in preview["servers"]}
+        results = []
+        for raw in selections:
+            if isinstance(raw, str):
+                match = by_id.get(raw)
+            else:
+                sid = raw.get("server_id") or raw.get("id")
+                match = by_id.get(sid) if sid else None
+                if match is None and raw.get("server_key"):
+                    match = next(
+                        (s for s in preview["servers"]
+                         if s.get("server_key") == raw.get("server_key")
+                         and bool(s.get("is_self")) == bool(raw.get("is_self", s.get("is_self")))
+                         and (raw.get("machine_id") in (None, s.get("machine_id"))
+                              or s.get("is_self"))),
+                        None)
+            if not match:
+                results.append({"ok": False, "message": "unknown server selection",
+                                "inference_changed": False})
+                continue
+            if not match.get("eligible_for_registration"):
+                results.append({
+                    "server_id": match.get("id"),
+                    "server_key": match.get("server_key"),
+                    "machine": match.get("machine"),
+                    "engine": match.get("engine"),
+                    "ok": False,
+                    "message": match.get("registration_blocked_reason")
+                               or "not eligible for registration",
+                    "inference_changed": False,
+                })
+                continue
+            ok, msg, detail = _mcc_register_server(
+                server_key=match.get("server_key"),
+                is_self=bool(match.get("is_self")),
+                machine_id=match.get("machine_id"),
+            )
+            results.append({
+                "server_id": match.get("id"),
+                "server_key": match.get("server_key"),
+                "machine": match.get("machine"),
+                "engine": match.get("engine"),
+                "ok": ok, "message": msg, **detail,
+            })
+
+        # Refresh inventory after registrations
+        ai_manager.request_refresh()
+        fleet_manager.request_poll()
+        try:
+            fleet_manager.poll_now()
+        except Exception:
+            pass
+        cards2, _, _ = _mcc_gather_cards()
+        after = fleet_setup_preview(cards2)
+        succeeded = sum(1 for r in results if r.get("ok"))
+        return jsonify({
+            "ok": succeeded == len(results) and len(results) > 0,
+            "message": f"registered {succeeded}/{len(results)} server(s)",
+            "data": {
+                "results": results,
+                "summary_after": after.get("summary"),
+                "servers_after": after.get("servers"),
+                "inference_changed": False,
+            },
+        })
+
     @app.route("/api/mcc/setup/preview", methods=["POST"])
     def mcc_setup_preview():
         body = request.get_json(silent=True) or {}
@@ -605,26 +770,33 @@ def create_app(sampler: SystemSampler | None = None,
 
     @app.route("/api/mcc/setup/apply", methods=["POST"])
     def mcc_setup_apply():
-        """Execute an explicitly approved setup action (local adopt only)."""
+        """Execute an explicitly approved setup action (register/adopt)."""
         body = request.get_json(silent=True) or {}
         action = (body.get("action") or "").strip()
         confirm = bool(body.get("confirm"))
         if not confirm:
             return _json_result(False, "confirm=true is required", status=400)
-        if action == "adopt_server":
+        if action in ("adopt_server", "register_server"):
             key = body.get("server_key")
-            if not key:
-                return _json_result(False, "server_key is required")
-            if not body.get("is_self", True):
-                return _json_result(
-                    False,
-                    "Adoption is local-only — run Set Up Management on the peer machine.")
-            ok, msg, warnings = ai_manager.adopt_server(key)
-            return _json_result(ok, msg, {"warnings": warnings})
+            is_self = bool(body.get("is_self", True))
+            mid = body.get("machine_id")
+            ok, msg, detail = _mcc_register_server(
+                server_key=key, is_self=is_self, machine_id=mid)
+            ai_manager.request_refresh()
+            fleet_manager.request_poll()
+            return _json_result(ok, msg, detail)
         if action == "enable_allow_control":
             mid = body.get("machine_id")
             if not mid:
                 return _json_result(False, "machine_id is required")
+            # Never auto-enable — require explicit enable_allow_control flag
+            if not bool(body.get("enable_allow_control")):
+                return _json_result(
+                    False,
+                    "Refusing to enable remote control implicitly. "
+                    "Pass enable_allow_control=true after operator confirmation, "
+                    "or use Fleet machine Configure.",
+                    status=400)
             ok, msg = fleet_manager.set_control(mid, True)
             return _json_result(ok, msg)
         return _json_result(False, f"unsupported setup action {action!r}")

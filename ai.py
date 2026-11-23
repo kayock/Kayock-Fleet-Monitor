@@ -1150,7 +1150,12 @@ class AIManager:
     def adopt_server(self, key):
         """Turn a discovered-but-unconfigured server into a configured one
         (pre-filled from the discovery record). This is the only way a
-        discovered server gains management controls."""
+        discovered server gains management controls.
+
+        Idempotent: if host:port is already registered, existing config is
+        preserved (no overwrite of exe/args). Registration alone does not
+        start/stop/load/unload anything.
+        """
         with self._lock:
             rec = next((r for r in self._records if r.get("key") == key), None)
         if not rec:
@@ -1158,11 +1163,26 @@ class AIManager:
         host = rec.get("host") or "127.0.0.1"
         if host not in LOCAL_HOSTS:
             return False, "only local servers can be adopted for management", []
+        try:
+            port = int(rec.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not 1 <= port <= 65535:
+            return False, f"invalid discovery port for key {key!r}", []
+        # Preserve existing registration for this endpoint
+        with self._lock:
+            for c in self._config:
+                if int(c.get("port") or 0) == port and \
+                        (c.get("host") or "127.0.0.1") == host:
+                    self.request_refresh()
+                    return True, "already registered", []
         return self.save_server_config({
             "id": uuid.uuid4().hex[:12],
-            "name": rec.get("name") or f"AI server @{rec.get('port')}",
+            "name": rec.get("name") or f"AI server @{port}",
             "type": rec.get("type") or "openai",
-            "host": host, "port": rec.get("port"),
+            "host": host, "port": port,
+            # exe left empty unless discovery already knows it — avoids
+            # implying process-control rights we do not have.
             "exe": rec.get("exe") or "",
             "args": "", "model_dir": "",
         })

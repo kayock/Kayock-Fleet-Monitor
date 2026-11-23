@@ -1,4 +1,4 @@
-# Model Control Center (Fleet Monitor v3.2.1)
+# Model Control Center (Fleet Monitor v3.2.2)
 
 Fleet-wide AI model management UI integrated into Kayock Fleet Monitor.
 
@@ -20,6 +20,17 @@ auto-loads models.
 | **Simple** (default) | Everyday use | Friendly name, machine, engine, loaded state, management status, Load/Unload/Settings |
 | **Advanced** | Power users | Plus resources, endpoint, remote-control state, editable engine params |
 | **Expert** | Operators | Plus identity key, raw configured launch args, engine notes, technical apply labels |
+
+## Configure Fleet Management (v3.2.2)
+
+**[Configure Fleet Management]** registers each inference server once.
+
+- Groups models under their servers (not one setup per model card)
+- Preview lists machine, engine, endpoint, model count, registration state, remote control, and supported actions
+- Distinguishes **model management** (load/unload) from **process management** (start/stop/restart)
+- Apply writes Fleet Monitor management config only — never starts/stops/loads/unloads
+- Remote registration uses existing `allow_control` peer proxy (`/api/ai/.../adopt`)
+- Does **not** automatically enable `allow_control`
 
 ## Profiles and Sync
 
