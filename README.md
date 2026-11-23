@@ -80,6 +80,15 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 - `ai_servers.json` — your configured AI servers (created on first save).
 - `fleet.json` — fleet machines incl. the per-machine `allow_control` flag.
 
+### Model Control Center (v3.2)
+
+Fleet-wide model cards with Simple / Advanced / Expert modes, remote
+load/unload (when `allow_control` is enabled), profiles, and pending-vs-active
+settings previews — without silently rewriting launch arguments.
+
+- Docs: [`docs/MODEL_CONTROL_CENTER.md`](docs/MODEL_CONTROL_CENTER.md)
+- Open the **Model Control** tab in the dashboard after upgrading to 3.2.0
+
 ### FOXAI AI Lab (companion app on port 3010)
 
 Fleet Monitor inventories AI servers; **AI Lab** is a separate Station service
@@ -183,6 +192,7 @@ Kayock Fleet Monitor/
 ├── sampler.py            THE single system sampler + cached snapshot
 ├── gpu.py                GPU collectors: Windows PDH/Get-Counter/nvidia-smi/WMI, Linux nvidia-smi + i915/sysfs + intel_gpu_top
 ├── ai.py                 AI server discovery/probing/status/config/controls
+├── mcc.py                Model Control Center capabilities, profiles, inventory cards
 ├── fleet.py              fleet polling (full detail cache), UDP LAN discovery, AI inventory, control proxy
 ├── utils.py  run_monitor.py  requirements.txt
 ├── setup_windows.bat  start_monitor.bat        (Windows launchers, CRLF)
@@ -190,6 +200,7 @@ Kayock Fleet Monitor/
 ├── templates/index.html  static/css/style.css  static/js/app.js  static/js/plotly.min.js
 ├── ai-lab/               FOXAI AI Lab Command Center (port 3010 companion)
 ├── docs/AI_LAB.md        AI Lab install, discovery, chat, compare, QR
+├── docs/MODEL_CONTROL_CENTER.md  MCC modes, load/unload, profiles, safety
 ├── tests/                automated pytest suite
 ├── docs/INSTALL.md        portable install + update guide
 ├── docs/INTEL_GPU.md      Intel util permission options
