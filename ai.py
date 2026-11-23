@@ -1330,7 +1330,7 @@ class AIManager:
         self.request_refresh()
         return True, f"stopped (pid {pid})", None
 
-    def restart_server(self, server_id, force=False):
+    def restart_server(self, server_id, force=False, model=None):
         ok, msg, tag = self.stop_server(server_id, force=force)
         if not ok:
             return False, msg, tag
@@ -1342,8 +1342,8 @@ class AIManager:
                 if not self._port_open(int(cfg["port"])):
                     break
                 self._sleeper(0.25)
-        ok2, msg2, model = self.start_server(server_id)
-        return ok2, f"restart: {msg}; {msg2}", model
+        ok2, msg2, started_model = self.start_server(server_id, model=model)
+        return ok2, f"restart: {msg}; {msg2}", started_model
 
     def _port_open(self, port, host="127.0.0.1"):
         try:

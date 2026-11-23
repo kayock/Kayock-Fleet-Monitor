@@ -11,6 +11,7 @@ htmlcov/
 # Runtime configuration – never publish machine-specific settings
 fleet.json
 ai_servers.json
+model_profiles.json
 monitor_config.json
 settings.local.json
 credentials.json
