@@ -80,6 +80,17 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 - `ai_servers.json` — your configured AI servers (created on first save).
 - `fleet.json` — fleet machines incl. the per-machine `allow_control` flag.
 
+### FOXAI AI Lab (companion app on port 3010)
+
+Fleet Monitor inventories AI servers; **AI Lab** is a separate Station service
+for Direct Chat, Compare Models, and QR tooling against those endpoints.
+
+- Source in this repository: [`ai-lab/`](ai-lab/)
+- Operator docs: [`docs/AI_LAB.md`](docs/AI_LAB.md)
+- Default URL: `http://10.0.0.202:3010/` (Compare: `/#compare`)
+- Runtime stays independent (`foxai-ai-lab.service`); it reads Fleet
+  Monitor `/metrics` and never auto-loads models.
+
 ## What the dashboard shows
 
 **Machine navigation** — `All Machines | <this machine> | <each peer>`:
@@ -177,6 +188,8 @@ Kayock Fleet Monitor/
 ├── setup_windows.bat  start_monitor.bat        (Windows launchers, CRLF)
 ├── setup_linux.sh  start_linux.sh              (Ubuntu launchers, executable)
 ├── templates/index.html  static/css/style.css  static/js/app.js  static/js/plotly.min.js
+├── ai-lab/               FOXAI AI Lab Command Center (port 3010 companion)
+├── docs/AI_LAB.md        AI Lab install, discovery, chat, compare, QR
 ├── tests/                automated pytest suite
 ├── docs/INSTALL.md        portable install + update guide
 ├── docs/INTEL_GPU.md      Intel util permission options
