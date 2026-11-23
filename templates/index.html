@@ -123,8 +123,8 @@
         </div>
       </div>
       <p class="note" id="mcc-intro">
-        Manage models across your fleet. Simple Mode keeps everyday controls clear;
-        Advanced and Expert progressively disclose engine-specific settings.
+        Manage models across your fleet. Sync builds persistent profiles from discovery.
+        Simple Mode keeps everyday controls clear; Advanced and Expert disclose engine-specific settings.
         Nothing loads, unloads, or restarts until you confirm.
       </p>
       <div class="mcc-toolbar">
@@ -132,19 +132,23 @@
           <button type="button" class="tab active" data-mcc-machine="all">All machines</button>
         </div>
         <input id="mcc-search" class="search-input" type="search"
-               placeholder="search model, engine, machine…" autocomplete="off">
+               placeholder="search name, model, engine, machine, tags…" autocomplete="off">
         <select id="mcc-filter" class="ai-model-select">
           <option value="all">all models</option>
           <option value="loaded">loaded</option>
           <option value="unloaded">unloaded</option>
           <option value="manageable">manageable</option>
+          <option value="needs_setup">needs setup</option>
+          <option value="protected">protected</option>
         </select>
-        <select id="mcc-profile-select" class="ai-model-select" title="Saved profiles (preview only until Apply)">
+        <select id="mcc-profile-select" class="ai-model-select" title="Saved profiles">
           <option value="">— profile —</option>
         </select>
+        <button type="button" class="btn small" id="mcc-sync-profiles">Sync Model Profiles</button>
         <button type="button" class="btn small" id="mcc-profile-preview">Preview profile</button>
         <button type="button" class="btn small" id="mcc-profile-new">New profile</button>
       </div>
+      <div id="mcc-sync-summary" class="mcc-profile-panel note" hidden></div>
       <div id="mcc-profile-panel" class="mcc-profile-panel note" hidden></div>
       <div id="mcc-settings-panel" class="mcc-settings-panel" hidden></div>
       <div id="mcc-cards" class="mcc-grid"></div>
@@ -168,7 +172,8 @@
       <div class="modal-foot">
         <button class="tab" id="mcc-modal-cancel" type="button">Cancel</button>
         <button class="tab" id="mcc-modal-save-profile" type="button">Save Profile</button>
-        <button class="tab" id="mcc-modal-apply" type="button">Apply Changes</button>
+        <button class="tab" id="mcc-modal-apply-supported" type="button">Apply Supported Changes</button>
+        <button class="tab" id="mcc-modal-apply-restart" type="button">Apply With Restart</button>
       </div>
     </div>
   </div>

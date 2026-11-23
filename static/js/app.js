@@ -1551,7 +1551,10 @@
     if (!sel) return;
     var opts = ['<option value="">— profile —</option>'];
     (state.mcc.profiles || []).forEach(function (p) {
-      opts.push('<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>');
+      var label = p.friendly_name || p.name || p.model || p.id;
+      if (p.machine) label += " · " + p.machine;
+      if (p.available === false) label += " (unavailable)";
+      opts.push('<option value="' + esc(p.id) + '">' + esc(label) + '</option>');
     });
     sel.innerHTML = opts.join("");
   }
@@ -1564,11 +1567,31 @@
       if (machine !== "all" && c.machine !== machine) return false;
       if (filter === "loaded" && c.model_status !== "loaded") return false;
       if (filter === "unloaded" && c.model_status !== "unloaded") return false;
-      if (filter === "manageable" && !(c.actions && (c.actions.load || c.actions.unload || c.actions.restart))) return false;
+      if (filter === "manageable") {
+        var ms = c.management_status || {};
+        if (!(ms.manageable || (c.actions && (c.actions.load || c.actions.unload || c.actions.restart || c.actions.switch_via_restart)))) {
+          return false;
+        }
+      }
+      if (filter === "needs_setup") {
+        var ns = c.management_status || {};
+        if (!ns.needs_setup) return false;
+      }
+      if (filter === "protected" && !c.protected) return false;
       if (!q) return true;
-      var hay = [c.model, c.machine, c.engine, c.server_name, c.endpoint].join(" ").toLowerCase();
+      var tags = (c.tags || []).join(" ");
+      var assoc = (c.associations || []).map(function (a) { return a.name || ""; }).join(" ");
+      var hay = [c.friendly_name, c.model, c.machine, c.engine, c.server_name, c.endpoint, tags, assoc].join(" ").toLowerCase();
       return hay.indexOf(q) >= 0;
     });
+  }
+
+  function mccMgmtChip(c) {
+    var ms = c.management_status || {};
+    var code = ms.code || "monitoring_only";
+    var cls = code === "manageable" ? "ok" : (ms.needs_setup ? "warn" : "");
+    return '<span class="status-chip ' + cls + '" title="' + esc(ms.detail || "") + '">'
+      + esc(ms.label || "Monitoring only") + '</span>';
   }
 
   function renderMCCCards() {
@@ -1582,23 +1605,43 @@
     var mode = state.mcc.mode || "simple";
     host.innerHTML = cards.map(function (c) {
       var status = c.model_status === "loaded" ? "Loaded" : (c.model ? "Unloaded" : (c.status || "unknown"));
-      var ctx = c.context_tokens != null ? (Number(c.context_tokens).toLocaleString() + " ctx") : "Context: Unknown — not reported by backend";
+      var ctx = c.context_tokens != null ? (Number(c.context_tokens).toLocaleString() + " ctx") : "Context: Unknown";
       var mem = [];
-      if (c.ram_bytes != null) mem.push("RAM " + fmtBytes(c.ram_bytes));
-      if (c.vram_bytes != null) mem.push("VRAM " + fmtBytes(c.vram_bytes));
-      if (c.size_bytes != null) mem.push("size " + fmtBytes(c.size_bytes));
+      if (c.model_status === "loaded" && c.model_ram_bytes != null) {
+        mem.push("Model RAM " + fmtBytes(c.model_ram_bytes));
+      } else if (c.model_status === "loaded" && c.ram_bytes != null) {
+        mem.push("Model RAM " + fmtBytes(c.ram_bytes));
+      } else if (c.model) {
+        mem.push("Model RAM: Unknown");
+      }
+      if (c.model_status === "loaded" && (c.model_vram_bytes != null || c.vram_bytes != null)) {
+        mem.push("Model VRAM " + fmtBytes(c.model_vram_bytes != null ? c.model_vram_bytes : c.vram_bytes));
+      }
+      if (c.size_bytes != null) mem.push("disk " + fmtBytes(c.size_bytes));
       var res = c.resources || {};
       if (mode !== "simple") {
-        if (res.ram_available_bytes != null) mem.push("avail RAM " + fmtBytes(res.ram_available_bytes));
-        if (res.vram_total_bytes != null) mem.push("GPU mem " + fmtBytes(res.vram_used_bytes || 0) + "/" + fmtBytes(res.vram_total_bytes));
+        if (c.server_ram_bytes != null) mem.push("server RSS " + fmtBytes(c.server_ram_bytes));
+        if (res.machine_ram_available_bytes != null || res.ram_available_bytes != null) {
+          mem.push("machine avail RAM " + fmtBytes(res.machine_ram_available_bytes != null ? res.machine_ram_available_bytes : res.ram_available_bytes));
+        }
+        if (res.machine_vram_total_bytes != null || res.vram_total_bytes != null) {
+          var vt = res.machine_vram_total_bytes != null ? res.machine_vram_total_bytes : res.vram_total_bytes;
+          var vu = res.machine_vram_used_bytes != null ? res.machine_vram_used_bytes : (res.vram_used_bytes || 0);
+          mem.push("machine GPU " + fmtBytes(vu) + "/" + fmtBytes(vt));
+        }
       }
       var btns = [];
+      var ms = c.management_status || {};
+      if (ms.needs_setup) {
+        btns.push('<button class="btn" data-mcc-act="setup" data-cid="' + esc(c.id) + '">Set Up Management</button>');
+      }
       if (c.actions.load) btns.push('<button class="btn" data-mcc-act="load" data-cid="' + esc(c.id) + '">Load</button>');
       if (c.actions.unload) btns.push('<button class="btn danger" data-mcc-act="unload" data-cid="' + esc(c.id) + '">Unload</button>');
       if (c.actions.switch_via_restart) btns.push('<button class="btn" data-mcc-act="switch" data-cid="' + esc(c.id) + '" title="Restart server with this model">Load via Restart</button>');
       if (c.actions.stop) btns.push('<button class="btn danger" data-mcc-act="stop" data-cid="' + esc(c.id) + '">Stop server</button>');
       if (c.actions.restart) btns.push('<button class="btn" data-mcc-act="restart" data-cid="' + esc(c.id) + '">Restart server</button>');
       btns.push('<button class="btn" data-mcc-act="settings" data-cid="' + esc(c.id) + '">Settings</button>');
+      btns.push('<button class="btn" data-mcc-act="rename" data-cid="' + esc(c.id) + '">Rename</button>');
       btns.push('<button class="btn" data-mcc-act="details" data-cid="' + esc(c.id) + '">Details</button>');
       if (!c.actions.load && c.disabled_reasons && c.disabled_reasons.load && c.model && c.model_status !== "loaded") {
         btns.push('<span class="mini">' + esc(c.disabled_reasons.load) + '</span>');
@@ -1606,29 +1649,45 @@
       if (!c.actions.unload && c.disabled_reasons && c.disabled_reasons.unload && c.model_status === "loaded") {
         btns.push('<span class="mini">' + esc(c.disabled_reasons.unload) + '</span>');
       }
+      var title = c.friendly_name || c.model || "(no model)";
+      var assocHtml = "";
+      (c.associations || []).forEach(function (a) {
+        assocHtml += '<div class="mini">' + esc(a.label || a.name || "association")
+          + (a.status === "confirmed" ? " ✓" : "") + '</div>';
+      });
+      var tagsHtml = (c.tags && c.tags.length)
+        ? '<div class="mini">Tags: ' + esc(c.tags.join(", ")) + '</div>' : "";
       var advanced = "";
       if (mode === "advanced" || mode === "expert") {
         advanced = '<div class="mcc-meta">'
+          + '<div><span>Actual model</span><b class="ellip">' + esc(c.model || "—") + '</b></div>'
           + '<div><span>Active requests</span><b>' + esc(c.active_requests != null ? c.active_requests : "—") + '</b></div>'
           + '<div><span>Tok/s</span><b>' + esc(c.tokens_per_sec != null ? c.tokens_per_sec : "—") + '</b></div>'
           + '<div><span>Endpoint</span><b class="ellip">' + esc(c.endpoint || "—") + '</b></div>'
           + '<div><span>Remote control</span><b>' + esc(c.is_self ? "local" : (c.allow_control ? "enabled" : "disabled")) + '</b></div>'
+          + '<div><span>Protected</span><b>' + esc(c.protected ? "yes" : "no") + '</b></div>'
           + '</div>';
       }
       if (mode === "expert") {
+        advanced += '<div class="mini">identity: ' + esc((c.identity && c.identity.key) || "—") + '</div>';
         advanced += '<div class="mini">configured args: ' + esc(c.configured_args || "(none / unknown)") + '</div>';
         advanced += '<div class="mini">engine note: ' + esc((c.capabilities && c.capabilities.notes) || "—") + '</div>';
       }
       return '<article class="mcc-card">'
         + '<div class="mcc-card-top">'
-        + '<h3>' + esc(c.model || "(no model)") + ' — ' + esc(c.machine) + '</h3>'
+        + '<h3>' + esc(title) + ' — ' + esc(c.machine) + (c.protected ? " 🔒" : "") + '</h3>'
         + '<span class="status-chip ' + (c.model_status === "loaded" ? "ok" : "warn") + '">' + esc(status) + '</span>'
+        + mccMgmtChip(c)
         + '</div>'
+        + (c.friendly_name && c.model && c.friendly_name !== c.model
+          ? '<div class="mcc-sub mini">Actual: <code>' + esc(c.model) + '</code></div>' : "")
         + '<div class="mcc-sub">Engine: <b>' + esc(c.engine_label || c.engine) + '</b> · '
         + esc(ctx) + (mem.length ? " · " + mem.join(" · ") : "") + '</div>'
         + '<div class="mcc-sub">Server: ' + esc(c.server_name || c.server_id || "—")
         + (c.quantization ? " · " + esc(c.quantization) : "")
-        + (c.parameter_size ? " · " + esc(c.parameter_size) : "") + '</div>'
+        + (c.parameter_size ? " · " + esc(c.parameter_size) : "")
+        + (c.profile_id ? " · profile " + esc(c.profile_id) : "") + '</div>'
+        + assocHtml + tagsHtml
         + advanced
         + '<div class="mcc-actions">' + btns.join("") + '</div>'
         + '</article>';
@@ -1639,20 +1698,37 @@
     return (state.mcc.cards || []).filter(function (c) { return c.id === cid; })[0];
   }
 
+  function mccApplyLabel(apply) {
+    if (apply === "per_request") return "Applied per request";
+    if (apply === "restart") return "Requires server restart";
+    if (apply === "reload") return "Requires model reload";
+    if (apply === "immediate") return "Can apply immediately";
+    if (apply === "unsupported") return "Not supported on this engine";
+    return "Apply method: " + apply;
+  }
+
   function openMCCSettings(card) {
     state.mcc.selectedCard = card;
     state.mcc.pending = {};
     var title = document.getElementById("mcc-modal-title");
-    if (title) title.textContent = (card.model || "Server") + " · Settings (" + (state.mcc.mode || "simple") + ")";
+    if (title) title.textContent = (card.friendly_name || card.model || "Server")
+      + " · Settings (" + (state.mcc.mode || "simple") + ")";
     var body = document.getElementById("mcc-modal-body");
     if (!body) return;
     var caps = card.capabilities || {};
     var params = caps.parameters || {};
     var mode = state.mcc.mode || "simple";
     var simpleKeys = ["context", "thinking", "temperature", "max_output", "keep_alive"];
-    var html = '<p class="note">Active = verified from the running server. Configured = stored launch settings. Pending = your edits (not applied yet).</p>';
-    html += '<div class="mcc-kv"><div><span>Active model</span><b>' + esc(card.model || "—") + '</b></div>';
+    var html = '<p class="note">Active = verified from the running server. Configured = stored launch settings. Pending = your edits (not applied yet). Request preferences do not change other applications automatically.</p>';
+    html += '<div class="mcc-kv"><div><span>Friendly name</span><b>' + esc(card.friendly_name || card.model || "—") + '</b></div>';
+    html += '<div><span>Actual model</span><b>' + esc(card.model || "—") + '</b></div>';
+    html += '<div><span>Machine / Engine</span><b>' + esc(card.machine) + " / " + esc(card.engine_label || card.engine) + '</b></div>';
+    html += '<div><span>Management</span><b>' + esc((card.management_status && card.management_status.label) || "—") + '</b></div>';
     html += '<div><span>Active context</span><b>' + esc(card.context_tokens != null ? card.context_tokens : "Unknown — not reported by backend") + '</b></div></div>';
+    html += '<label class="mcc-field"><input type="checkbox" id="mcc-protected-toggle"'
+      + (card.protected ? " checked" : "") + '> Protected model (confirm before disruptive actions)</label>';
+    html += '<label class="mcc-field">Tags (comma-separated)<input id="mcc-tags-input" type="text" value="'
+      + esc((card.tags || []).join(", ")) + '" placeholder="Application Models, Coding, …"></label>';
     var keys = Object.keys(params);
     if (mode === "simple") keys = keys.filter(function (k) { return simpleKeys.indexOf(k) >= 0; });
     if (mode !== "expert") keys = keys.filter(function (k) { return k !== "launch_args"; });
@@ -1661,29 +1737,47 @@
       if (meta.ui === "none") return;
       var support = meta.support || "unknown";
       var apply = meta.apply || "unknown";
-      html += '<label class="mcc-field">' + esc(meta.label || k)
-        + '<span class="mini"> · ' + esc(support) + " · apply: " + esc(apply) + '</span>'
+      html += '<label class="mcc-field"><b>' + esc(meta.label || k) + '</b>'
         + (meta.help ? '<div class="mini">' + esc(meta.help) + '</div>' : "")
-        + (meta.note ? '<div class="mini">' + esc(meta.note) + '</div>' : "");
+        + '<div class="mini">' + esc(mccApplyLabel(apply)) + '</div>';
+      if (mode === "expert") {
+        html += '<div class="mini">tech: ' + esc(support) + " · apply: " + esc(apply) + '</div>';
+      }
+      if (meta.note) html += '<div class="mini">' + esc(meta.note) + '</div>';
       if (support === "unsupported") {
         html += '<div class="mini">Unsupported on this engine.</div></label>';
         return;
       }
+      var saved = (card.request_settings && card.request_settings[k] != null)
+        ? card.request_settings[k]
+        : ((card.startup_settings && card.startup_settings[k] != null) ? card.startup_settings[k] : "");
       if (meta.ui === "toggle") {
         html += '<select data-mcc-param="' + esc(k) + '"><option value="">— leave unchanged —</option>'
-          + '<option value="true">Enabled</option><option value="false">Disabled</option></select>';
+          + '<option value="true"' + (saved === true ? " selected" : "") + '>Enabled</option>'
+          + '<option value="false"' + (saved === false ? " selected" : "") + '>Disabled</option></select>';
+      } else if (meta.ui === "slider" || meta.ui === "number" || meta.ui === "slider_number") {
+        html += '<input data-mcc-param="' + esc(k) + '" type="number"'
+          + (meta.min != null ? ' min="' + meta.min + '"' : "")
+          + (meta.max != null ? ' max="' + meta.max + '"' : "")
+          + (meta.step != null ? ' step="' + meta.step + '"' : "")
+          + ' placeholder="leave blank to keep current" value="' + esc(saved !== "" && saved != null ? saved : "") + '">';
       } else {
-        html += '<input data-mcc-param="' + esc(k) + '" type="text" placeholder="leave blank to keep current">';
+        html += '<input data-mcc-param="' + esc(k) + '" type="text" placeholder="leave blank to keep current" value="'
+          + esc(saved !== "" && saved != null ? saved : "") + '">';
       }
       html += '</label>';
     });
-    if (mode === "simple") {
+    if (mode === "simple" || mode === "advanced") {
       html += '<label class="mcc-field">Quick profile template'
         + '<select id="mcc-quick-template"><option value="">— optional —</option>';
       (state.mcc.templates || []).forEach(function (t, i) {
         html += '<option value="' + i + '">' + esc(t.name) + '</option>';
       });
       html += '</select><div class="mini">Templates never auto-apply — they only fill pending fields.</div></label>';
+    }
+    if (mode === "expert") {
+      html += '<div class="mini">Endpoint: ' + esc(card.endpoint || "—") + '</div>';
+      html += '<div class="mini">Configured args: ' + esc(card.configured_args || "(none)") + '</div>';
     }
     body.innerHTML = html;
     openModal("mcc-modal");
@@ -1714,10 +1808,21 @@
     return pending;
   }
 
-  function mccPreviewAndMaybeApply(apply) {
+  function mccCollectMeta() {
+    var prot = document.getElementById("mcc-protected-toggle");
+    var tagsEl = document.getElementById("mcc-tags-input");
+    var tags = [];
+    if (tagsEl && tagsEl.value.trim()) {
+      tags = tagsEl.value.split(",").map(function (t) { return t.trim(); }).filter(Boolean);
+    }
+    return { protected: !!(prot && prot.checked), tags: tags };
+  }
+
+  function mccApplySettings(mode) {
     var card = state.mcc.selectedCard;
     if (!card) return;
     var pending = collectMCCPending();
+    var meta = mccCollectMeta();
     postJSON("/api/mcc/settings/preview", {
       engine: card.engine,
       configured_args: card.configured_args,
@@ -1726,32 +1831,103 @@
       pending: pending,
     }).then(function (res) {
       var view = (res.body && res.body.data) || {};
+      var cls = view.classification || {};
       var lines = (view.changes || []).map(function (ch) {
         return ch.label + ":\n  Current: " + ch.current + "\n  Requested: " + ch.requested
-          + "\n  (" + ch.apply + ")";
+          + "\n  (" + mccApplyLabel(ch.apply) + ")";
       });
-      if (!lines.length) {
-        window.alert("No pending changes.");
+      if (!lines.length && mode !== "save_profile") {
+        // Still allow saving protected/tags
+        if (card.profile_id) {
+          fetch("/api/mcc/profiles/" + encodeURIComponent(card.profile_id), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ protected: meta.protected, tags: meta.tags }),
+          }).then(function () { refreshMCC(); closeModal("mcc-modal"); });
+        }
+        window.alert("No pending parameter changes.");
         return;
       }
-      var msg = lines.join("\n\n")
-        + (view.restart_required ? "\n\nRestart required to apply startup settings." : "")
-        + "\n\n" + (apply ? "Apply these changes now?" : "Preview only — nothing applied.");
-      if (!apply) { window.alert(msg); return; }
-      if (!window.confirm(msg)) return;
-      if (view.restart_required) {
-        if (!card.actions.restart) {
-          window.alert("This change needs a restart, but restart is not available for this server (configure/adopt it and enable remote control if needed). Previous configuration was not modified.");
+      var msg = (lines.length ? lines.join("\n\n") + "\n\n" : "")
+        + (cls.restart_required ? "Startup settings require Apply With Restart.\n" : "")
+        + "Request preferences are saved to the profile and used by integrations that read them — they do not silently change every app.\n";
+      if (mode === "save_profile") {
+        if (!window.confirm(msg + "\nSave to profile only (no engine changes)?")) return;
+      } else if (mode === "supported") {
+        if (!window.confirm(msg + "\nApply Supported Changes (save request prefs; leave restart-required pending)?")) return;
+      } else if (mode === "with_restart") {
+        if (!card.is_self) {
+          window.alert("Startup argument changes must be applied on the machine that owns the server config.");
           return;
         }
-        if (!window.confirm("Confirm restart of " + (card.server_name || card.server_id)
-          + " on " + card.machine + "?\n\nPrevious launch args are preserved in the server config until you save new args in Configure / Expert Mode.\nThis UI does not silently rewrite launch arguments.")) return;
-        // Safety: do not rewrite args automatically. Expert must edit Configure.
-        window.alert("Restart-required settings must be written into Launch arguments via Configure / Expert Mode, then Restart. Pending request-level prefs were not forced into the server.\n\nNothing was changed automatically.");
-        return;
+        if (!window.confirm(msg + "\nThis will merge known startup flags into ai_servers.json (preserving unknown args) and restart the server.\nContinue?")) return;
+        if (card.protected || meta.protected) {
+          if (!window.confirm("PROTECTED MODEL\n\n"
+            + (card.friendly_name || card.model) + " on " + card.machine
+            + "\nAssociations: " + ((card.associations || []).map(function (a) { return a.name; }).join(", ") || "none")
+            + "\n\nConfirm disruptive restart?")) return;
+        }
       }
-      window.alert("Pending values are request-level preferences. They are not written into Modelfiles or launch args automatically. Use them from AI Lab / clients when sending prompts.\n\nNothing destructive was applied.");
+      var payload = {
+        mode: mode,
+        pending: pending,
+        engine: card.engine,
+        configured_args: card.configured_args,
+        live_context: card.context_tokens,
+        live_model: card.model,
+        model: card.model,
+        machine: card.machine,
+        machine_id: card.machine_id,
+        server_id: card.server_id,
+        is_self: !!card.is_self,
+        profile_id: card.profile_id,
+        identity: card.identity,
+        friendly_name: card.friendly_name,
+        protected: meta.protected,
+        confirm_restart: mode === "with_restart",
+        confirm_disruptive: mode === "with_restart",
+        do_restart: mode === "with_restart",
+      };
+      postJSON("/api/mcc/settings/apply", payload).then(function (r) {
+        var data = (r.body && r.body.data) || {};
+        var summary = [];
+        (data.saved || []).forEach(function (x) {
+          summary.push("Saved " + x.parameter + " as " + x.as);
+        });
+        (data.applied || []).forEach(function (x) {
+          summary.push("Applied: " + (x.change || x.parameter));
+        });
+        (data.pending || []).forEach(function (x) {
+          summary.push("Still pending: " + x.parameter + " — " + x.reason);
+        });
+        (data.skipped || []).forEach(function (x) {
+          summary.push("Skipped: " + (x.parameter || "") + " " + (x.reason || ""));
+        });
+        if (data.new_args) summary.push("New args: " + data.new_args);
+        if (data.restart_performed) summary.push("Restart: " + (data.restart_message || "ok"));
+        window.alert((r.body && r.body.message ? r.body.message + "\n\n" : "") + (summary.join("\n") || "Done."));
+        // Also patch tags/protected
+        if (card.profile_id) {
+          fetch("/api/mcc/profiles/" + encodeURIComponent(card.profile_id), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ protected: meta.protected, tags: meta.tags }),
+          }).finally(function () { closeModal("mcc-modal"); refreshMCC(); });
+        } else {
+          closeModal("mcc-modal");
+          refreshMCC();
+        }
+      });
     });
+  }
+
+  function mccConfirmProtected(card, actionLabel) {
+    if (!card.protected) return true;
+    var apps = (card.associations || []).map(function (a) { return a.name; }).join(", ") || "unknown apps";
+    return window.confirm("PROTECTED MODEL\n\n"
+      + (card.friendly_name || card.model) + " on " + card.machine
+      + "\nMay affect: " + apps
+      + "\n\nAction: " + actionLabel + "\n\nConfirm?");
   }
 
   function mccAct(act, cid) {
@@ -1759,22 +1935,76 @@
     if (!card) return;
     if (act === "details") {
       window.alert(JSON.stringify({
+        friendly_name: card.friendly_name,
         machine: card.machine, engine: card.engine, model: card.model,
         status: card.status, model_status: card.model_status,
+        management_status: card.management_status,
         endpoint: card.endpoint, context_tokens: card.context_tokens,
+        identity: card.identity, associations: card.associations,
+        protected: card.protected, tags: card.tags,
         actions: card.actions, disabled_reasons: card.disabled_reasons,
         resources: card.resources,
+        model_ram_bytes: card.model_ram_bytes, server_ram_bytes: card.server_ram_bytes,
       }, null, 2));
       return;
     }
     if (act === "settings") { openMCCSettings(card); return; }
-    if (!card.server_id) {
-      window.alert("This server is not configured for management. Adopt it on its own machine first.");
+    if (act === "rename") {
+      if (!card.profile_id) {
+        window.alert("Sync Model Profiles first so this installation has a profile.");
+        return;
+      }
+      var nn = window.prompt("Friendly display name (API still uses the actual model id)",
+        card.friendly_name || card.model || "");
+      if (!nn) return;
+      fetch("/api/mcc/profiles/" + encodeURIComponent(card.profile_id), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ friendly_name: nn, name: nn }),
+      }).then(function (r) { return r.json(); }).then(function (body) {
+        showResult({ status: 200, body: body });
+        refreshMCC();
+      });
+      return;
+    }
+    if (act === "setup") {
+      postJSON("/api/mcc/setup/preview", { card: card }).then(function (r) {
+        var d = (r.body && r.body.data) || {};
+        var lines = (d.explanation || []).concat(
+          (d.proposed_actions || []).map(function (a) {
+            return "→ " + a.label + (a.automatic ? " (can apply here)" : " (manual)");
+          })
+        );
+        window.alert("Set Up Management\n\n"
+          + (d.friendly_name || d.model || "") + " on " + (d.machine || "")
+          + "\nEngine: " + (d.engine || "") + "\n"
+          + "Status: " + ((d.current_status && d.current_status.label) || "") + "\n\n"
+          + lines.join("\n") + "\n\n" + (d.note || ""));
+        var actions = d.proposed_actions || [];
+        var auto = actions.filter(function (a) { return a.automatic || a.action === "enable_allow_control"; });
+        if (!auto.length) return;
+        if (!window.confirm("Apply the first available setup action now?\n" + auto[0].label)) return;
+        var a0 = auto[0];
+        postJSON("/api/mcc/setup/apply", {
+          action: a0.action,
+          confirm: true,
+          server_key: a0.server_key || card.server_key,
+          machine_id: card.machine_id,
+          is_self: !!card.is_self,
+        }).then(function (r2) {
+          showResult(r2);
+          setTimeout(refreshMCC, 1000);
+        });
+      });
+      return;
+    }
+    if (!card.server_id && act !== "setup") {
+      window.alert("This server is not configured for management. Use Set Up Management first.");
       return;
     }
     if (act === "load" || act === "switch") {
       if (!card.model) { window.alert("No model selected."); return; }
-      // Memory warning (estimate)
+      if (!mccConfirmProtected(card, act === "switch" ? "Load via Restart" : "Load")) return;
       postJSON("/api/mcc/memory-warning", {
         model_size_bytes: card.size_bytes,
         available_ram_bytes: (card.resources || {}).ram_available_bytes,
@@ -1815,6 +2045,7 @@
     }
     if (act === "unload") {
       if (!card.model) return;
+      if (!mccConfirmProtected(card, "Unload")) return;
       if (!window.confirm("Unload model '" + card.model + "' on " + card.machine + "?")) return;
       postJSON(mccControlUrl(card, "unload"), { model: card.model }).then(function (r) {
         showResult(r); setTimeout(refreshMCC, 1500);
@@ -1822,6 +2053,7 @@
       return;
     }
     if (act === "stop") {
+      if (!mccConfirmProtected(card, "Stop server")) return;
       if (!window.confirm("Stop model server on " + card.machine + "? This is Stop server, not Unload model.")) return;
       postJSON(mccControlUrl(card, "stop"), { force: false }).then(function (r) {
         if (r.status === 409 && window.confirm((r.body && r.body.message) + "\n\nForce stop?")) {
@@ -1833,6 +2065,7 @@
       return;
     }
     if (act === "restart") {
+      if (!mccConfirmProtected(card, "Restart server")) return;
       if (!window.confirm("Restart model server on " + card.machine + "?")) return;
       postJSON(mccControlUrl(card, "restart"), { force: false }).then(function (r) {
         if (r.status === 409 && window.confirm((r.body && r.body.message) + "\n\nForce restart?")) {
@@ -1884,26 +2117,44 @@
       var el = document.getElementById(id);
       if (el) el.addEventListener("click", function () { closeModal("mcc-modal"); });
     });
-    var apply = document.getElementById("mcc-modal-apply");
-    if (apply) apply.addEventListener("click", function () { mccPreviewAndMaybeApply(true); });
+    var applySup = document.getElementById("mcc-modal-apply-supported");
+    if (applySup) applySup.addEventListener("click", function () { mccApplySettings("supported"); });
+    var applyRst = document.getElementById("mcc-modal-apply-restart");
+    if (applyRst) applyRst.addEventListener("click", function () { mccApplySettings("with_restart"); });
     var saveProf = document.getElementById("mcc-modal-save-profile");
-    if (saveProf) saveProf.addEventListener("click", function () {
-      var card = state.mcc.selectedCard || {};
-      var pending = collectMCCPending();
-      var name = window.prompt("Profile name", (card.model || "model") + " custom");
-      if (!name) return;
-      postJSON("/api/mcc/profiles", {
-        name: name,
-        engine: card.engine,
-        model: card.model,
-        machine: card.machine,
-        server_id: card.server_id,
-        settings: pending,
-        startup_settings: {},
-        request_settings: pending,
-      }).then(function (r) {
-        showResult(r);
-        refreshMCC();
+    if (saveProf) saveProf.addEventListener("click", function () { mccApplySettings("save_profile"); });
+    var syncBtn = document.getElementById("mcc-sync-profiles");
+    if (syncBtn) syncBtn.addEventListener("click", function () {
+      var chip = document.getElementById("mcc-status");
+      if (chip) { chip.textContent = "syncing profiles…"; chip.className = "status-chip warn"; }
+      postJSON("/api/mcc/profiles/sync", {}).then(function (r) {
+        var data = (r.body && r.body.data) || {};
+        var s = data.summary || {};
+        state.mcc.cards = data.cards || state.mcc.cards;
+        state.mcc.profiles = data.profiles || state.mcc.profiles;
+        renderMCCFilters();
+        renderMCCProfiles();
+        renderMCCCards();
+        var panel = document.getElementById("mcc-sync-summary");
+        if (panel) {
+          panel.hidden = false;
+          panel.innerHTML = "<b>Sync summary</b> — created: " + esc(s.created || 0)
+            + ", updated: " + esc(s.updated || 0)
+            + ", unchanged: " + esc(s.unchanged || 0)
+            + ", temporarily unavailable: " + esc(s.unavailable || 0)
+            + ((s.conflicts && s.conflicts.length) ? ", conflicts: " + esc(s.conflicts.join("; ")) : "")
+            + "<br><span class='mini'>Non-destructive: no engines, launch args, or running processes were modified.</span>";
+        }
+        if (chip) {
+          chip.textContent = (state.mcc.cards || []).length + " model card(s) · "
+            + (state.mcc.profiles || []).length + " profile(s)";
+          chip.className = "status-chip ok";
+        }
+      }).catch(function (err) {
+        if (chip) {
+          chip.textContent = "sync error: " + (err && err.message ? err.message : err);
+          chip.className = "status-chip err";
+        }
       });
     });
     var preview = document.getElementById("mcc-profile-preview");
@@ -1924,7 +2175,7 @@
         panel.hidden = false;
         var lines = (view.changes || []).map(function (ch) {
           return esc(ch.label) + ": " + esc(String(ch.current)) + " → " + esc(String(ch.requested))
-            + " (" + esc(ch.apply) + ")";
+            + " (" + esc(mccApplyLabel(ch.apply)) + ")";
         });
         panel.innerHTML = "<b>Profile preview (not applied):</b> "
           + esc((view.profile && view.profile.name) || "")
