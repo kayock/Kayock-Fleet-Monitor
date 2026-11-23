@@ -1091,46 +1091,68 @@ class ProfileStore:
 
                 existing = by_ident.get(key)
                 if not existing:
-                    profile = {
-                        "id": uuid.uuid4().hex[:12],
-                        "name": default_friendly_name(card.get("model"), card.get("machine") or ""),
-                        "friendly_name": default_friendly_name(
-                            card.get("model"), card.get("machine") or ""),
-                        "description": "",
-                        "engine": card.get("engine"),
-                        "model": card.get("model"),
-                        "machine": card.get("machine"),
-                        "machine_id": card.get("machine_id"),
-                        "server_id": card.get("server_id"),
-                        "server_key": card.get("server_key"),
-                        "endpoint": card.get("endpoint"),
-                        "identity": ident,
-                        "model_path": card.get("model_path"),
-                        "quantization": card.get("quantization"),
-                        "parameter_size": card.get("parameter_size"),
-                        "size_bytes": card.get("size_bytes"),
-                        "detected_context": card.get("context_tokens"),
-                        "configured_context": configured.get("context"),
-                        "configured_args": card.get("configured_args"),
-                        "model_status": card.get("model_status"),
-                        "management_status": card.get("management_status"),
-                        "startup_settings": {},
-                        "request_settings": {},
-                        "settings": {},
-                        "associations": associations,
-                        "protected": False,
-                        "tags": [],
-                        "notes": "",
-                        "user_customized": False,
-                        "available": True,
-                        "last_seen_at": now,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                    self._profiles.append(profile)
-                    by_ident[key] = profile
-                    summary["created"] += 1
-                    continue
+                    # Adopt a legacy profile (pre-identity) that uniquely matches
+                    # model + machine so user customizations are preserved.
+                    orphans = [
+                        p for p in self._profiles
+                        if not (p.get("identity") or {}).get("key")
+                        and (p.get("model") or "") == (card.get("model") or "")
+                        and (p.get("machine") or "") == (card.get("machine") or "")
+                    ]
+                    if len(orphans) == 1:
+                        existing = orphans[0]
+                        existing["identity"] = ident
+                        existing["friendly_name"] = (
+                            existing.get("friendly_name") or existing.get("name")
+                            or default_friendly_name(card.get("model"), card.get("machine") or ""))
+                        existing["user_customized"] = True
+                        by_ident[key] = existing
+                        # Fall through to discovery update below
+                    else:
+                        if len(orphans) > 1:
+                            summary["conflicts"].append(
+                                f"multiple legacy profiles for {card.get('model')} on "
+                                f"{card.get('machine')} — left untouched")
+                        profile = {
+                            "id": uuid.uuid4().hex[:12],
+                            "name": default_friendly_name(card.get("model"), card.get("machine") or ""),
+                            "friendly_name": default_friendly_name(
+                                card.get("model"), card.get("machine") or ""),
+                            "description": "",
+                            "engine": card.get("engine"),
+                            "model": card.get("model"),
+                            "machine": card.get("machine"),
+                            "machine_id": card.get("machine_id"),
+                            "server_id": card.get("server_id"),
+                            "server_key": card.get("server_key"),
+                            "endpoint": card.get("endpoint"),
+                            "identity": ident,
+                            "model_path": card.get("model_path"),
+                            "quantization": card.get("quantization"),
+                            "parameter_size": card.get("parameter_size"),
+                            "size_bytes": card.get("size_bytes"),
+                            "detected_context": card.get("context_tokens"),
+                            "configured_context": configured.get("context"),
+                            "configured_args": card.get("configured_args"),
+                            "model_status": card.get("model_status"),
+                            "management_status": card.get("management_status"),
+                            "startup_settings": {},
+                            "request_settings": {},
+                            "settings": {},
+                            "associations": associations,
+                            "protected": False,
+                            "tags": [],
+                            "notes": "",
+                            "user_customized": False,
+                            "available": True,
+                            "last_seen_at": now,
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                        self._profiles.append(profile)
+                        by_ident[key] = profile
+                        summary["created"] += 1
+                        continue
 
                 # Update discovery metadata only; preserve user fields.
                 # last_seen_at always refreshes and does not count as "updated".
@@ -1184,6 +1206,74 @@ class ProfileStore:
                         summary["unavailable"] += 1
                     else:
                         summary["unchanged"] += 1
+
+            # Merge customizations from leftover legacy orphans into matching
+            # identity profiles (never delete the orphan). Idempotent.
+            for orphan in list(self._profiles):
+                if (orphan.get("identity") or {}).get("key"):
+                    continue
+                if not orphan.get("model"):
+                    continue
+                if orphan.get("superseded_by") or "Superseded by inventory profile" in (orphan.get("notes") or ""):
+                    continue
+                matches = [
+                    p for p in self._profiles
+                    if (p.get("identity") or {}).get("key")
+                    and (p.get("model") or "") == (orphan.get("model") or "")
+                    and (p.get("machine") or "") == (orphan.get("machine") or "")
+                ]
+                if len(matches) != 1:
+                    continue
+                target = matches[0]
+                merged_any = False
+                for field in ("request_settings", "startup_settings", "settings"):
+                    src = orphan.get(field) or {}
+                    dst = dict(target.get(field) or {})
+                    if src and not dst:
+                        target[field] = dict(src)
+                        merged_any = True
+                    elif src:
+                        for sk, sv in src.items():
+                            if sk not in dst:
+                                dst[sk] = sv
+                                merged_any = True
+                        target[field] = dst
+                # Prefer customized friendly name from orphan when target still
+                # uses the raw model id.
+                o_name = orphan.get("friendly_name") or orphan.get("name")
+                t_name = target.get("friendly_name") or target.get("name")
+                if o_name and (not t_name or t_name == target.get("model")):
+                    target["friendly_name"] = o_name
+                    target["name"] = o_name
+                    merged_any = True
+                if orphan.get("protected") and not target.get("protected"):
+                    target["protected"] = True
+                    merged_any = True
+                if orphan.get("tags") and not target.get("tags"):
+                    target["tags"] = list(orphan.get("tags") or [])
+                    merged_any = True
+                if orphan.get("notes") and not (target.get("notes") or "").strip():
+                    # Do not copy the superseded boilerplate note
+                    note = orphan.get("notes") or ""
+                    if "Superseded by inventory profile" not in note:
+                        target["notes"] = note
+                        merged_any = True
+                if orphan.get("associations") and not target.get("associations"):
+                    target["associations"] = list(orphan.get("associations") or [])
+                    merged_any = True
+                orphan["superseded_by"] = target.get("id")
+                orphan["available"] = False
+                if merged_any:
+                    target["user_customized"] = True
+                    target["updated_at"] = now
+                    summary["updated"] += 1
+                orphan["notes"] = (
+                    (orphan.get("notes") or "")
+                    + ("\n" if orphan.get("notes") else "")
+                    + f"Superseded by inventory profile {target.get('id')} "
+                      "(customizations merged; legacy entry kept)."
+                ).strip()
+                orphan["updated_at"] = now
 
             try:
                 self._save()

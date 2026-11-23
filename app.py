@@ -84,7 +84,7 @@ def create_app(sampler: SystemSampler | None = None,
     # ---------------- dashboard + snapshots ----------------
     @app.route("/")
     def index():
-        return render_template(
+        resp = app.make_response(render_template(
             "index.html",
             refresh_ms=int(round(sampler.refresh_seconds * 1000)),
             history_len=sampler.history_len,
@@ -92,7 +92,10 @@ def create_app(sampler: SystemSampler | None = None,
             app_name=APP_NAME,
             machine_label=machine_label or socket.gethostname(),
             self_port=self_port or 0,
-        )
+        ))
+        # Prevent stale MCC UI after upgrades
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
 
     @app.route("/metrics")
     def metrics():

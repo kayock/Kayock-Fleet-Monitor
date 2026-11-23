@@ -272,6 +272,80 @@ def test_profile_sync_no_duplicates_and_preserves_friendly(tmp_path):
     assert any(x.get("available") is False for x in store.list_profiles())
 
 
+def test_profile_sync_adopts_legacy_orphan(tmp_path):
+    store = ProfileStore(path=str(tmp_path / "profiles.json"))
+    # Legacy pre-identity profile with custom request prefs
+    store.save({
+        "name": "gpt-oss:20b custom",
+        "model": "gpt-oss:20b",
+        "machine": "Portable",
+        "engine": "ollama",
+        "request_settings": {"temperature": 1, "top_p": 0.95, "max_output": 2048},
+    })
+    cards = build_model_cards(
+        machine="Portable", machine_id="port1", allow_control=True, is_self=False,
+        servers=[{
+            "id": "o1", "key": "127.0.0.1:11434", "name": "ollama", "type": "ollama",
+            "status": "online", "configured": True,
+            "capabilities": {"can_load": True, "can_unload": True,
+                             "can_start": True, "can_stop": True, "can_restart": True},
+            "loaded_models": [],
+            "installed_models": ["gpt-oss:20b"],
+            "host": "127.0.0.1", "port": 11434, "url": "http://127.0.0.1:11434",
+        }],
+    )
+    s1 = store.sync_from_cards(cards)
+    assert s1["created"] == 0  # adopted orphan instead of creating
+    profs = store.list_profiles()
+    assert len(profs) == 1
+    p = profs[0]
+    assert (p.get("identity") or {}).get("key")
+    assert p["request_settings"]["temperature"] == 1
+    assert p["friendly_name"] == "gpt-oss:20b custom"
+
+
+def test_profile_sync_merges_orphan_into_existing_identity(tmp_path):
+    store = ProfileStore(path=str(tmp_path / "profiles.json"))
+    cards = build_model_cards(
+        machine="Portable", machine_id="port1", allow_control=True, is_self=False,
+        servers=[{
+            "id": "o1", "key": "127.0.0.1:11434", "name": "ollama", "type": "ollama",
+            "status": "online", "configured": True,
+            "capabilities": {"can_load": True, "can_unload": True,
+                             "can_start": True, "can_stop": True, "can_restart": True},
+            "loaded_models": [],
+            "installed_models": ["gpt-oss:20b"],
+            "host": "127.0.0.1", "port": 11434, "url": "http://127.0.0.1:11434",
+        }],
+    )
+    store.sync_from_cards(cards)
+    # Simulate leftover legacy orphan alongside inventory profile
+    store.save({
+        "name": "gpt-oss:20b custom",
+        "model": "gpt-oss:20b",
+        "machine": "Portable",
+        "engine": "ollama",
+        "request_settings": {"temperature": 1, "top_p": 0.95},
+        "identity": {},
+    })
+    # Clear identity that save may have left empty — force orphan
+    with store._lock:
+        for p in store._profiles:
+            if p.get("name") == "gpt-oss:20b custom":
+                p["identity"] = {}
+        store._save()
+    s2 = store.sync_from_cards(cards)
+    assert s2["created"] == 0
+    inv = [p for p in store.list_profiles() if (p.get("identity") or {}).get("key")]
+    assert len(inv) == 1
+    assert inv[0]["request_settings"]["temperature"] == 1
+    assert inv[0]["friendly_name"] == "gpt-oss:20b custom"
+    # Orphan kept, not deleted
+    orphans = [p for p in store.list_profiles() if not (p.get("identity") or {}).get("key")]
+    assert len(orphans) == 1
+    assert orphans[0].get("available") is False
+
+
 def test_guess_association_unverified_only():
     a = guess_association("saturday-gm-gemmasutra:latest")
     assert a and a["status"] == "possible_unverified"

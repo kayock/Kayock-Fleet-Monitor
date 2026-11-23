@@ -4,16 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ machine_label }} — {{ app_name }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ app_version }}">
   <script>
     // Injected server constants (single source of truth for the browser loop)
     window.MONITOR_CONFIG = {
       refreshMs: {{ refresh_ms }},
-      historyLen: {{ history_len }}
+      historyLen: {{ history_len }},
+      appVersion: "{{ app_version }}"
     };
   </script>
-  <script src="{{ url_for('static', filename='js/plotly.min.js') }}"></script>
-  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='js/plotly.min.js') }}?v={{ app_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}?v={{ app_version }}" defer></script>
 </head>
 <body>
   <div id="loading-overlay">
@@ -167,8 +168,10 @@
         <button class="tab" id="mcc-modal-close" type="button">✕</button>
       </div>
       <div class="modal-body" id="mcc-modal-body"></div>
-      <!-- Placeholder id for static-asset id agreement; rebuilt when Settings opens. -->
+      <!-- Placeholder ids for static-asset id agreement; rebuilt when Settings opens. -->
       <select id="mcc-quick-template" hidden aria-hidden="true"></select>
+      <input id="mcc-protected-toggle" type="checkbox" hidden aria-hidden="true">
+      <input id="mcc-tags-input" type="text" hidden aria-hidden="true">
       <div class="modal-foot">
         <button class="tab" id="mcc-modal-cancel" type="button">Cancel</button>
         <button class="tab" id="mcc-modal-save-profile" type="button">Save Profile</button>
