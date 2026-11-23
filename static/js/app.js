@@ -1486,6 +1486,7 @@
   }
 
   /* ================= v3.2: Model Control Center ================= */
+  state.diag = { card: null, data: null, tab: "overview", reportText: "" };
   state.mcc = {
     mode: "simple",
     machine: "all",
@@ -1669,8 +1670,12 @@
       if (c.actions.stop) btns.push('<button class="btn danger" data-mcc-act="stop" data-cid="' + esc(c.id) + '">Stop server</button>');
       if (c.actions.restart) btns.push('<button class="btn" data-mcc-act="restart" data-cid="' + esc(c.id) + '">Restart server</button>');
       btns.push('<button class="btn" data-mcc-act="settings" data-cid="' + esc(c.id) + '">Settings</button>');
-      btns.push('<button class="btn" data-mcc-act="rename" data-cid="' + esc(c.id) + '">Rename</button>');
-      btns.push('<button class="btn" data-mcc-act="details" data-cid="' + esc(c.id) + '">Details</button>');
+      btns.push('<button class="btn" data-mcc-act="diagnostics" data-cid="' + esc(c.id) + '">Diagnostics</button>');
+      btns.push('<details class="mcc-more"><summary class="btn">More</summary>'
+        + '<div class="mcc-more-menu">'
+        + '<button class="btn small" data-mcc-act="rename" data-cid="' + esc(c.id) + '">Rename</button>'
+        + '<button class="btn small" data-mcc-act="details" data-cid="' + esc(c.id) + '">Raw card JSON</button>'
+        + '</div></details>');
       if (!c.actions.load && c.disabled_reasons && c.disabled_reasons.load && c.model && c.model_status !== "loaded") {
         btns.push('<span class="mini">' + esc(c.disabled_reasons.load) + '</span>');
       }
@@ -1958,9 +1963,352 @@
       + "\n\nAction: " + actionLabel + "\n\nConfirm?");
   }
 
+  // ---- AI Diagnostics (v3.3, read-only) ----
+  function diagFieldHtml(label, meta) {
+    if (!meta || typeof meta !== "object") {
+      return '<div class="diag-field-row"><span>' + esc(label) + '</span>'
+        + '<b>Unknown — backend does not report this setting.</b></div>';
+    }
+    var display = meta.known === false
+      ? (meta.display || "Unknown — backend does not report this setting.")
+      : (meta.display != null ? meta.display : meta.value);
+    var src = (meta.layer || "") + (meta.source ? " · " + meta.source : "");
+    return '<div class="diag-field-row"><span>' + esc(label) + '</span>'
+      + '<div><b>' + esc(String(display)) + '</b>'
+      + (src ? '<div class="src">' + esc(src) + '</div>' : "")
+      + '</div></div>';
+  }
+
+  function renderDiagBody() {
+    var body = document.getElementById("diag-modal-body");
+    if (!body || !state.diag.data) return;
+    var mode = state.mcc.mode || "simple";
+    var d = state.diag.data;
+    var insp = d.inspection || {};
+    var ov = insp.overview || {};
+    var fields = ((insp.backend || {}).fields) || {};
+    var profileFields = insp.profile_fields || {};
+    var tab = state.diag.tab || "overview";
+    var html = "";
+
+    if (tab === "overview") {
+      var statusDisp = (fields.model_status && fields.model_status.display)
+        || ov.model_status_display
+        || ov.model_status
+        || "—";
+      var failBox = "";
+      if (d.retrieval_ok === false || (insp.resolution && insp.resolution.error)) {
+        failBox = '<div class="diag-finding error">'
+          + '<b>Diagnostic retrieval failed</b>'
+          + '<div>Model: ' + esc(ov.model || "—") + '</div>'
+          + '<div>Machine: ' + esc(ov.machine || "—") + '</div>'
+          + '<div>Operation: live configuration inspect</div>'
+          + '<div class="mini">' + esc((insp.resolution && insp.resolution.error)
+            || ((insp.backend && insp.backend.errors) || []).join("; ")
+            || "Backend unreachable or unparsable") + '</div>'
+          + '<button type="button" class="btn" id="diag-retry-btn">Retry Diagnostics</button>'
+          + '</div>';
+      }
+      html += failBox;
+      html += '<div class="diag-section"><h4>Overview</h4><div class="mcc-kv">'
+        + '<div><span>Model</span><b class="ellip">' + esc(ov.model || "—") + '</b></div>'
+        + '<div><span>Friendly name</span><b>' + esc(ov.friendly_name || "—") + '</b></div>'
+        + '<div><span>Machine</span><b>' + esc(ov.machine || "—") + '</b></div>'
+        + '<div><span>Engine</span><b>' + esc(ov.engine || "—") + '</b></div>'
+        + '<div><span>Endpoint</span><b class="ellip">' + esc(ov.endpoint || "—") + '</b></div>'
+        + (ov.configured_endpoint && ov.configured_endpoint !== ov.endpoint
+          ? '<div><span>Configured endpoint</span><b class="ellip">' + esc(ov.configured_endpoint) + '</b></div>' : "")
+        + '<div><span>Status</span><b>' + esc(statusDisp) + '</b></div>'
+        + '</div>'
+        + (ov.endpoint_note ? '<div class="mini">' + esc(ov.endpoint_note) + '</div>' : "")
+        + (ov.model_status_source ? '<div class="mini">Status source: ' + esc(ov.model_status_source) + '</div>' : "")
+        + '<p class="note">Read-only inspection. Values are never invented; unknown means the backend did not report the setting. Failed retrieval is not the same as unloaded.</p></div>';
+      if ((insp.backend || {}).notes && insp.backend.notes.length) {
+        html += '<div class="mini">' + esc(insp.backend.notes.join(" ")) + '</div>';
+      }
+      var perf = d.performance || {};
+      html += '<div class="diag-section"><h4>Performance history</h4><div class="mcc-kv">'
+        + '<div><span>Completed</span><b>' + esc(perf.requests_completed != null ? perf.requests_completed : "—") + '</b></div>'
+        + '<div><span>Failed</span><b>' + esc(perf.requests_failed != null ? perf.requests_failed : "—") + '</b></div>'
+        + '<div><span>Avg tok/s</span><b>' + esc(perf.average_tokens_per_sec != null ? perf.average_tokens_per_sec : "—") + '</b></div>'
+        + '<div><span>Avg duration ms</span><b>' + esc(perf.average_elapsed_ms != null ? perf.average_elapsed_ms : "—") + '</b></div>'
+        + '<div><span>Timeouts</span><b>' + esc(perf.timeout_count != null ? perf.timeout_count : "—") + '</b></div>'
+        + '<div><span>Output limits</span><b>' + esc(perf.output_limit_occurrences != null ? perf.output_limit_occurrences : "—") + '</b></div>'
+        + '</div><div class="mini">' + esc(perf.note || "") + '</div></div>';
+    } else if (tab === "configuration") {
+      html += '<div class="diag-section"><h4>Model / server (reported)</h4>';
+      var keys = Object.keys(fields);
+      if (!keys.length) html += '<div class="note">No backend fields available.</div>';
+      keys.forEach(function (k) {
+        if (mode === "simple" && ["startup_arguments", "capabilities"].indexOf(k) >= 0) return;
+        html += diagFieldHtml(k, fields[k]);
+      });
+      html += '</div><div class="diag-section"><h4>Saved profile preferences</h4>'
+        + '<p class="mini">These are preferences — not necessarily live server settings.</p>';
+      var pk = Object.keys(profileFields);
+      if (!pk.length) html += '<div class="note">No saved profile preferences for this installation.</div>';
+      pk.forEach(function (k) { html += diagFieldHtml(k, profileFields[k]); });
+      html += '</div>';
+      if (mode === "expert" && (insp.backend || {}).raw) {
+        html += '<div class="diag-section"><h4>Raw backend metadata</h4>'
+          + '<pre class="mini" style="white-space:pre-wrap;max-height:240px;overflow:auto">'
+          + esc(JSON.stringify(insp.backend.raw, null, 2)) + '</pre></div>';
+      }
+      if ((insp.backend || {}).errors && insp.backend.errors.length) {
+        html += '<div class="diag-section"><h4>Inspection notes</h4><ul>'
+          + insp.backend.errors.map(function (e) { return '<li class="mini">' + esc(e) + '</li>'; }).join("")
+          + '</ul></div>';
+      }
+    } else if (tab === "requests") {
+      var rows = d.recent_requests || [];
+      html += '<div class="diag-section"><h4>Recent inference requests</h4>';
+      if (!rows.length) {
+        html += '<div class="note">No captured requests yet. Use FOXAI AI Lab chat/compare to generate metadata.</div>';
+      } else {
+        rows.forEach(function (r) {
+          var stop = r.stop_reason || {};
+          var tkind = r.timeout_kind || stop.timeout_kind || "";
+          html += '<div class="diag-finding">'
+            + '<div><b>' + esc(r.id || "") + '</b> · ' + esc(r.client || "")
+            + ' · ' + esc(new Date((r.ts || 0) * 1000).toLocaleString()) + '</div>'
+            + '<div class="mini">ok=' + esc(String(r.ok))
+            + ' · stop=' + esc(stop.label || "—")
+            + ' (' + esc(stop.confidence || "") + ')'
+            + (tkind ? ' · timeout_kind=' + esc(tkind) : "")
+            + (r.partial ? ' · partial' : "")
+            + ' · prompt=' + esc(r.prompt_tokens != null ? r.prompt_tokens : "—")
+            + ' · completion=' + esc(r.completion_tokens != null ? r.completion_tokens : "—")
+            + ' · max_tokens=' + esc((r.request && (r.request.max_tokens || r.request.max_output)) != null
+              ? (r.request.max_tokens || r.request.max_output) : "model default")
+            + ' · ' + esc(r.elapsed_ms != null ? r.elapsed_ms + " ms" : "")
+            + (r.tokens_per_sec != null ? " · " + r.tokens_per_sec + " tok/s" : "")
+            + '</div>';
+          if ((mode !== "simple" || tkind) && r.error) {
+            html += '<div class="mini">error: ' + esc(r.error) + '</div>';
+          }
+          if (mode === "expert") {
+            html += '<div class="mini">done_reason=' + esc(r.done_reason || "—")
+              + ' finish_reason=' + esc(r.finish_reason || "—")
+              + (tkind ? ' timeout_kind=' + esc(tkind) : "") + '</div>';
+          }
+          html += '</div>';
+        });
+      }
+      html += '</div>';
+    } else if (tab === "troubleshooting") {
+      html += '<div class="diag-section"><h4>Configuration conflicts</h4>';
+      (d.conflicts || []).forEach(function (c) {
+        html += '<div class="diag-finding">'
+          + '<b>' + esc(c.title || c.code) + '</b>'
+          + '<div class="mini">severity: ' + esc(c.severity || "")
+          + ' · confidence: ' + esc(c.confidence || "") + '</div>'
+          + '<div>' + esc(c.detail || "") + '</div></div>';
+      });
+      html += '</div><div class="diag-section"><h4>Findings from recent requests</h4>';
+      var findings = [];
+      (d.recent_requests || []).slice(0, 5).forEach(function (r) {
+        (r.findings || []).forEach(function (f) { findings.push(f); });
+      });
+      if (!findings.length) {
+        html += '<div class="note">No troubleshooting findings yet.</div>';
+      }
+      findings.forEach(function (f) {
+        var sev = f.severity || "info";
+        html += '<div class="diag-finding ' + esc(sev) + '">'
+          + '<b>What happened</b><div>' + esc(f.what_happened || "") + '</div>'
+          + '<b>Evidence</b><div class="mini">' + esc(
+            Array.isArray(f.evidence) ? f.evidence.join("; ") : String(f.evidence || "")) + '</div>'
+          + (f.likely_cause ? '<b>Likely cause</b><div>' + esc(f.likely_cause) + '</div>' : "")
+          + '<b>Suggested next step</b><div>' + esc(f.suggested_next_step || "") + '</div>'
+          + '<div class="mini">Confidence: ' + esc(f.confidence || "") + '</div></div>';
+      });
+      html += '</div>';
+    } else if (tab === "reports") {
+      html += '<div class="diag-section"><h4>Reports</h4>'
+        + '<p class="note">Reports exclude prompts, responses, and secrets by default.</p>'
+        + '<pre class="mini" style="white-space:pre-wrap;max-height:360px;overflow:auto">'
+        + esc(state.diag.reportText || "(click Copy or Export to generate)")
+        + '</pre></div>';
+    }
+    body.innerHTML = html;
+  }
+
+  function fetchDiagnostics(card) {
+    var body = document.getElementById("diag-modal-body");
+    if (body) body.innerHTML = '<div class="note">Loading read-only configuration…</div>';
+    return postJSON("/api/diagnostics/inspect", {
+      card_id: card.id,
+      model: card.model,
+      machine: card.machine,
+      endpoint: card.endpoint,
+      engine: card.engine,
+    }).then(function (r) {
+      state.diag.data = (r.body && r.body.data) || null;
+      if (r.body && r.body.ok === false && state.diag.data) {
+        state.diag.data.retrieval_ok = false;
+        state.diag.data.api_message = r.body.message || "";
+      }
+      renderDiagBody();
+      var retry = document.getElementById("diag-retry-btn");
+      if (retry) retry.addEventListener("click", function () {
+        fetchDiagnostics(state.diag.card || card);
+      });
+    }).catch(function (err) {
+      var cardInfo = state.diag.card || card || {};
+      if (body) body.innerHTML = '<div class="diag-finding error">'
+        + '<b>Diagnostic retrieval failed</b>'
+        + '<div>Model: ' + esc(cardInfo.model || "—") + '</div>'
+        + '<div>Machine: ' + esc(cardInfo.machine || "—") + '</div>'
+        + '<div>Operation: POST /api/diagnostics/inspect</div>'
+        + '<div class="mini">' + esc(err && err.message ? err.message : String(err)) + '</div>'
+        + '<button type="button" class="btn" id="diag-retry-btn">Retry Diagnostics</button>'
+        + '</div>';
+      var retry = document.getElementById("diag-retry-btn");
+      if (retry) retry.addEventListener("click", function () {
+        fetchDiagnostics(state.diag.card || card);
+      });
+    });
+  }
+
+  function openDiagnostics(card) {
+    state.diag.card = card;
+    state.diag.tab = "overview";
+    state.diag.data = null;
+    state.diag.reportText = "";
+    var title = document.getElementById("diag-modal-title");
+    if (title) title.textContent = "Diagnostics · " + (card.friendly_name || card.model || "model")
+      + " (" + (state.mcc.mode || "simple") + ")";
+    document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-diag-tab") === "overview");
+    });
+    openModal("diag-modal");
+    fetchDiagnostics(card);
+  }
+
+  function openDiagnosticsByRecordId(recordId) {
+    if (!recordId) return;
+    setView("mcc", null);
+    state.diag.card = { model: "(from diagnostic link)", friendly_name: "Diagnostic record" };
+    state.diag.tab = "overview";
+    state.diag.data = null;
+    state.diag.reportText = "";
+    var title = document.getElementById("diag-modal-title");
+    if (title) title.textContent = "Diagnostics · record " + recordId;
+    openModal("diag-modal");
+    var body = document.getElementById("diag-modal-body");
+    if (body) body.innerHTML = "<div class='note'>Loading diagnostic record "
+      + esc(recordId) + "…</div>";
+    fetch("/api/diagnostics/record/" + encodeURIComponent(recordId) + "?soft=1", {
+      cache: "no-store",
+    }).then(function (r) { return r.json().then(function (j) {
+      return { status: r.status, body: j };
+    }); }).then(function (res) {
+      if (!res.body || !res.body.ok || !res.body.data) {
+        if (body) body.innerHTML = '<div class="diag-finding error">'
+          + "<b>Diagnostic record not found</b>"
+          + "<div>Requested id: <code>" + esc(recordId) + "</code></div>"
+          + "<div>HTTP status: " + esc(res.status) + "</div>"
+          + "<div>Endpoint: GET /api/diagnostics/record/" + esc(recordId) + "</div>"
+          + "<div>" + esc((res.body && res.body.message) || "not found") + "</div>"
+          + (res.body && res.body.lookup
+            ? "<div>Lookup: " + esc(JSON.stringify(res.body.lookup)) + "</div>" : "")
+          + "</div>";
+        return;
+      }
+      var rec = res.body.data;
+      var lookup = res.body.lookup || {};
+      state.diag.card = {
+        model: rec.model,
+        machine: rec.machine,
+        endpoint: rec.endpoint,
+        engine: rec.engine,
+        friendly_name: rec.model || recordId,
+      };
+      if (title) {
+        title.textContent = "Diagnostics · " + (rec.model || recordId)
+          + (lookup.match === "soft_id"
+            ? " (matched " + (lookup.resolved_id || rec.id) + ")"
+            : "");
+      }
+      // Hydrate inspect view around this record's identity, then highlight it.
+      return fetchDiagnostics(state.diag.card).then(function () {
+        if (!state.diag.data) state.diag.data = {};
+        state.diag.data.focus_record = rec;
+        state.diag.data.focus_lookup = lookup;
+        state.diag.tab = "requests";
+        document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
+          b.classList.toggle("active", b.getAttribute("data-diag-tab") === "requests");
+        });
+        renderDiagBody();
+        // Ensure the focused record is visible even if inspect filtered it out
+        var host = document.getElementById("diag-modal-body");
+        if (host && rec) {
+          var focus = document.createElement("div");
+          focus.className = "diag-section";
+          focus.innerHTML = "<h4>Linked diagnostic record</h4>"
+            + '<div class="diag-finding error">'
+            + "<div><b>Id:</b> <code>" + esc(rec.id) + "</code>"
+            + (lookup.match === "soft_id"
+              ? " <span class='mini'>(soft-matched from " + esc(recordId)
+                + ", distance " + esc(lookup.distance) + ")</span>"
+              : "")
+            + "</div>"
+            + "<div><b>Model:</b> " + esc(rec.model) + " · <b>Machine:</b> "
+            + esc(rec.machine || "—") + "</div>"
+            + "<div><b>Stop:</b> " + esc((rec.stop_reason && rec.stop_reason.label) || "—")
+            + ((rec.timeout_kind || (rec.stop_reason && rec.stop_reason.timeout_kind))
+              ? " · timeout_kind=" + esc(rec.timeout_kind
+                || (rec.stop_reason && rec.stop_reason.timeout_kind))
+              : "")
+            + "</div>"
+            + "<div><b>Duration:</b> " + esc(rec.elapsed_ms != null ? rec.elapsed_ms + " ms" : "—")
+            + " · <b>ok:</b> " + esc(String(rec.ok))
+            + (rec.error ? " · <b>error:</b> " + esc(rec.error) : "")
+            + "</div></div>";
+          host.insertBefore(focus, host.firstChild);
+        }
+      });
+    }).catch(function (err) {
+      if (body) body.innerHTML = '<div class="diag-finding error">'
+        + "Failed to load record: " + esc(err && err.message ? err.message : err)
+        + "</div>";
+    });
+  }
+
+  function applyDiagHash() {
+    var raw = (location.hash || "").replace(/^#/, "");
+    if (!raw) return;
+    // Support #mcc?diag=<id> and #diag=<id>
+    var diagId = null;
+    if (raw.indexOf("mcc") === 0 && raw.indexOf("diag=") >= 0) {
+      var q = raw.split("?")[1] || "";
+      q.split("&").forEach(function (part) {
+        var kv = part.split("=");
+        if (kv[0] === "diag") diagId = decodeURIComponent(kv[1] || "");
+      });
+    } else if (raw.indexOf("diag=") === 0) {
+      diagId = decodeURIComponent(raw.slice(5));
+    }
+    if (diagId) openDiagnosticsByRecordId(diagId);
+  }
+
+  function diagFetchReport(asText) {
+    var card = state.diag.card || {};
+    return postJSON("/api/diagnostics/report", {
+      card_id: card.id,
+      model: card.model,
+      machine: card.machine,
+      endpoint: card.endpoint,
+      engine: card.engine,
+      format: asText ? "text" : "json",
+      include_raw: (state.mcc.mode || "") === "expert",
+    });
+  }
+
   function mccAct(act, cid) {
     var card = findMCCCard(cid);
     if (!card) return;
+    if (act === "diagnostics") { openDiagnostics(card); return; }
     if (act === "details") {
       window.alert(JSON.stringify({
         friendly_name: card.friendly_name,
@@ -2242,6 +2590,62 @@
       var el = document.getElementById(id);
       if (el) el.addEventListener("click", function () { closeModal("mcc-modal"); });
     });
+    ["diag-modal-close", "diag-modal-cancel"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener("click", function () { closeModal("diag-modal"); });
+    });
+    var diagTabs = document.getElementById("diag-tabs");
+    if (diagTabs) diagTabs.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-diag-tab]");
+      if (!btn) return;
+      state.diag.tab = btn.getAttribute("data-diag-tab") || "overview";
+      document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
+        b.classList.toggle("active", b === btn);
+      });
+      if (state.diag.tab === "reports" && !state.diag.reportText) {
+        diagFetchReport(true).then(function (r) {
+          var data = (r.body && r.body.data) || {};
+          state.diag.reportText = data.text || JSON.stringify(data.report || data, null, 2);
+          renderDiagBody();
+        });
+      } else {
+        renderDiagBody();
+      }
+    });
+    var diagCopy = document.getElementById("diag-copy-report");
+    if (diagCopy) diagCopy.addEventListener("click", function () {
+      diagFetchReport(true).then(function (r) {
+        var data = (r.body && r.body.data) || {};
+        var text = data.text || "";
+        state.diag.reportText = text;
+        state.diag.tab = "reports";
+        document.querySelectorAll("#diag-tabs .tab").forEach(function (b) {
+          b.classList.toggle("active", b.getAttribute("data-diag-tab") === "reports");
+        });
+        renderDiagBody();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            window.alert("Diagnostic report copied to clipboard.");
+          }).catch(function () {
+            window.prompt("Copy report:", text);
+          });
+        } else {
+          window.prompt("Copy report:", text);
+        }
+      });
+    });
+    var diagExport = document.getElementById("diag-export-json");
+    if (diagExport) diagExport.addEventListener("click", function () {
+      diagFetchReport(false).then(function (r) {
+        var data = (r.body && r.body.data) || {};
+        var blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "fleet-diagnostic-" + Date.now() + ".json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      });
+    });
     var applySup = document.getElementById("mcc-modal-apply-supported");
     if (applySup) applySup.addEventListener("click", function () { mccApplySettings("supported"); });
     var applyRst = document.getElementById("mcc-modal-apply-restart");
@@ -2322,9 +2726,14 @@
   // debug handle (harmless in production, invaluable for diagnosis)
   window.__MONITOR_STATE = state;
   // Bind MCC after DOM hooks exist
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bindMCC);
-  } else {
+  function bootMCC() {
     bindMCC();
+    applyDiagHash();
+    window.addEventListener("hashchange", applyDiagHash);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootMCC);
+  } else {
+    bootMCC();
   }
 })();

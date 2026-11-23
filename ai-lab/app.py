@@ -19,7 +19,23 @@ import discovery
 ROOT = Path(__file__).resolve().parent
 QR_SRC = Path("/home/kayock/Projects/Kayock-QR-Generator/src")
 APP_NAME = "FOXAI AI Lab Command Center"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.1"
+
+
+def _parse_max_tokens(body: dict):
+    """None = model/client default. Reject invalid custom values."""
+    if "max_tokens" not in body:
+        return None, None
+    return chat_proxy.normalize_max_tokens(body.get("max_tokens"))
+
+
+def _parse_timeouts(body: dict) -> dict | None:
+    raw = body.get("timeouts")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
 
 app = Flask(__name__, static_folder=str(ROOT / "static"),
             template_folder=str(ROOT / "templates"))
@@ -33,7 +49,21 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "app": APP_NAME, "version": APP_VERSION,
-                    "ts": time.time()})
+                    "ts": time.time(),
+                    "timeouts": chat_proxy.resolve_timeouts()})
+
+
+@app.get("/api/settings/timeouts")
+def api_timeout_settings():
+    """Read-only view of effective timeout defaults (env + built-in)."""
+    return jsonify({"ok": True, "data": chat_proxy.resolve_timeouts(),
+                    "notes": {
+                        "connect": "Time to establish TCP/HTTP connection",
+                        "first_token": "Time allowed before first stream chunk",
+                        "read_inactivity": "Max idle time between stream chunks",
+                        "total": "Optional overall wall-clock limit (null = none for streaming)",
+                        "nonstream_total": "Total timeout for non-streaming requests (default 90s)",
+                    }})
 
 
 @app.get("/api/servers")
@@ -64,10 +94,12 @@ def api_chat():
     messages = body.get("messages") or []
     if not endpoint or not model or not messages:
         return jsonify({"ok": False, "error": "endpoint, model, messages required"}), 400
+    max_tokens, mt_err = _parse_max_tokens(body)
+    if mt_err:
+        return jsonify({"ok": False, "error": mt_err}), 400
+    timeouts = _parse_timeouts(body)
     # Streaming?
     if body.get("stream"):
-        engine_l = engine.lower()
-
         def generate():
             try:
                 info = chat_proxy.list_loaded_models(endpoint, engine)
@@ -88,7 +120,8 @@ def api_chat():
                     for chunk in chat_proxy.stream_ollama_chat(
                             endpoint=endpoint, model=model, messages=messages,
                             think=body.get("think", "auto"),
-                            max_tokens=int(body.get("max_tokens") or 256)):
+                            max_tokens=max_tokens,
+                            timeouts=timeouts):
                         yield chunk
                 else:
                     if info.get("ok") is False:
@@ -99,7 +132,8 @@ def api_chat():
                         return
                     for chunk in chat_proxy.stream_openai_chat(
                             endpoint=endpoint, model=model, messages=messages,
-                            max_tokens=int(body.get("max_tokens") or 256)):
+                            max_tokens=max_tokens,
+                            timeouts=timeouts):
                         yield chunk
             except Exception as exc:
                 yield (json.dumps({"ok": False,
@@ -111,8 +145,9 @@ def api_chat():
     result = chat_proxy.chat_completion(
         endpoint=endpoint, engine=engine, model=model, messages=messages,
         think=body.get("think", "auto"),
-        max_tokens=int(body.get("max_tokens") or 128),
+        max_tokens=max_tokens,
         require_loaded=bool(body.get("require_loaded", True)),
+        timeouts=timeouts,
     )
     return jsonify(result), (200 if result.get("ok") else 400)
 
@@ -134,7 +169,10 @@ def api_compare():
         return jsonify({"ok": False, "error": "select at most 3 models"}), 400
 
     think = body.get("think", "auto")
-    max_tokens = int(body.get("max_tokens") or 96)
+    max_tokens, mt_err = _parse_max_tokens(body)
+    if mt_err:
+        return jsonify({"ok": False, "error": mt_err}), 400
+    timeouts = _parse_timeouts(body)
 
     def run_one(index: int, t: dict) -> tuple[int, dict]:
         endpoint = (t.get("endpoint") or "").strip()
@@ -146,6 +184,7 @@ def api_compare():
             think=think,
             max_tokens=max_tokens,
             require_loaded=True,
+            timeouts=timeouts,
         )
         one["target"] = {
             "endpoint": endpoint, "engine": engine, "model": model,

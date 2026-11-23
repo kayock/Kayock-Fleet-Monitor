@@ -80,6 +80,16 @@ and add the other two (name + host/IP + monitor port 5000). Or just press
 - `ai_servers.json` — your configured AI servers (created on first save).
 - `fleet.json` — fleet machines incl. the per-machine `allow_control` flag.
 
+### AI Diagnostics (v3.3.1)
+
+Read-only model configuration inspection, inference request history, stop-reason
+classification (including `timeout_kind`), soft record lookup, and diagnostic
+reports. See [docs/AI_DIAGNOSTICS.md](docs/AI_DIAGNOSTICS.md).
+
+MCC cards include a **Diagnostics** button. FOXAI AI Lab posts metadata-only
+records to `/api/diagnostics/ingest`. Deep links use `/#mcc?diag=<id>` and
+`GET /api/diagnostics/record/<id>` (optional `?soft=1` for typo-tolerant match).
+
 ### Model Control Center (v3.2.2)
 
 Open the **Model Control** tab for fleet-wide model inventory and management
@@ -115,12 +125,14 @@ Full detail: [`docs/MODEL_CONTROL_CENTER.md`](docs/MODEL_CONTROL_CENTER.md).
 
 ### FOXAI AI Lab (companion app on port 3010)
 
-Fleet Monitor inventories AI servers; **AI Lab** is a separate companion service
-for Direct Chat, Compare Models, and QR tooling against those endpoints.
+Fleet Monitor inventories AI servers; **AI Lab** is a **separate repository and
+service** for Direct Chat, Compare Models, and QR tooling against those endpoints.
 
-- Source in this repository: [`ai-lab/`](ai-lab/)
+- Canonical repo: [kayock/FOXAI-AI-Lab](https://github.com/kayock/FOXAI-AI-Lab) (**v1.3.1**)
+- Convenience mirror in this repository: [`ai-lab/`](ai-lab/)
 - Operator docs: [`docs/AI_LAB.md`](docs/AI_LAB.md)
 - Default local URL: `http://127.0.0.1:3010/` (Compare: `/#compare`)
+- Streaming chat uses first-token + inactivity timeouts (not a fixed 90s total)
 - Runtime stays independent; it reads Fleet Monitor `/metrics` and never auto-loads models.
 
 ## What the dashboard shows

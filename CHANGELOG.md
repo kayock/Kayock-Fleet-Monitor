@@ -2,6 +2,73 @@
 
 All notable changes to Kayock Fleet Monitor are documented in this file.
 
+## [v3.3.1] — 2026-11-23
+
+Stable release of AI Diagnostics plus streaming-timeout and diagnostic-lookup
+fixes. Merged from `feature/ai-diagnostics-v3.3`. Companion **FOXAI AI Lab
+v1.3.1** is published separately at
+[kayock/FOXAI-AI-Lab](https://github.com/kayock/FOXAI-AI-Lab).
+
+### Fixed
+
+- Soft-match diagnostic record lookup (`GET /api/diagnostics/record/<id>?soft=1`)
+  so transcription typos (for example `a822…` → `a82d…`) still resolve
+- `#mcc?diag=<id>` deep links open MCC and retrieve the linked record (not only
+  the modal shell)
+- Stop-reason / troubleshooting distinguish `timeout_kind`
+  (`connection`, `first_token`, `stream_inactivity`, `total`, `nonstream_total`)
+- Remote peer loopback endpoints resolve to fleet host for diagnostics inspect
+  (from `4d493b2`)
+
+### Verified live
+
+- DeepSeek Q8 extended stream via AI Lab: 895 tokens, 255.6s, 3.53 tok/s,
+  normal completion; diagnostic `0baa669fdd5b` retrieved in Fleet Monitor
+- Three-machine fleet connectivity preserved; inference services not restarted
+
+## [v3.3.0] — 2026-11-23
+
+AI Diagnostics & Troubleshooting Center (pre-release station deploy from
+`feature/ai-diagnostics-v3.3`). Read-only by default; does not alter inference
+configurations or restart inference services.
+
+Station deploy commit: `3c9acc0` + `APP_VERSION=3.3.0` bump. AI Lab runtime
+`/home/kayock/Applications/FoxaiAiLab` at v1.3.0.
+
+### Added
+
+- **Model Configuration Inspector** — Diagnostics button on MCC cards; live
+  read-only inspection via Ollama `/api/show`+`/api/ps`, llama.cpp `/props`,
+  LM Studio and Lemonade capability-aware probes
+- **Inference request metadata** — stop-reason classification, token accounting,
+  timing, bounded local history (`diagnostic_history.json`)
+- **FOXAI AI Lab bridge** — chat/compare posts metadata-only records to
+  `/api/diagnostics/ingest`; UI shows stop reason + Diagnostics link
+- **Streaming diagnostics** — Ollama NDJSON and OpenAI SSE emit exactly one
+  final record (including interrupted / cancelled / timed-out streams)
+- **Rules-based troubleshooting** — deterministic findings (output limit,
+  context, timeout, connection, model unavailable, slow generation)
+- **Configuration conflict detection** — distinguishes intentional overrides vs
+  potential conflicts across model/server/profile/request layers
+- **Performance history** — completed/failed counts, avg tok/s, timeouts,
+  output-limit occurrences (from captured requests only)
+- **Diagnostic reports** — Copy text / Export JSON with privacy sanitization
+
+### Fixed (AI Lab)
+
+- Removed hard-coded Direct Chat `max_tokens: 96` and Compare `max_tokens: 64`
+- Direct Chat / Compare: **Maximum Output Tokens** = model default or custom
+- Model-default mode omits Ollama `num_predict` and OpenAI `max_tokens`
+- Compact per-response diagnostic summary with Fleet Monitor deep link
+- `request_id` de-duplication on diagnostics ingest
+
+### Safety / non-goals
+
+- Never invents missing values; unknown fields labeled explicitly
+- Does not store prompts, responses, or credentials
+- Does not load/unload models, change contexts, or restart inference services
+- Not deployed to production without explicit approval
+
 ## [v3.2.2] — 2026-11-23
 
 Stable Model Control Center release: fleet-wide server registration, accurate

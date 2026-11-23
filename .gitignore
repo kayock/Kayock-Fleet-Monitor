@@ -15,6 +15,8 @@ model_profiles.json
 monitor_config.json
 settings.local.json
 credentials.json
+diagnostic_history.json
+diagnostic_history.json.tmp
 api_keys.txt
 secrets.yaml
 .env
