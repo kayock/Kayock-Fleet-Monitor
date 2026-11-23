@@ -107,6 +107,72 @@
     </section>
   </div>
 
+  <!-- ===== Model Control Center (fleet-wide) ===== -->
+  <div id="view-mcc" hidden>
+    <section class="card card-ai" id="card-mcc">
+      <div class="card-head">
+        <h2>Model Control Center</h2>
+        <div class="headline">
+          <span class="status-chip" id="mcc-status">loading…</span>
+          <span class="sort-tabs">
+            <button type="button" class="tab mcc-mode active" data-mcc-mode="simple">Simple</button>
+            <button type="button" class="tab mcc-mode" data-mcc-mode="advanced">Advanced</button>
+            <button type="button" class="tab mcc-mode" data-mcc-mode="expert">Expert</button>
+            <button type="button" class="tab" id="mcc-refresh">⟳ Refresh</button>
+          </span>
+        </div>
+      </div>
+      <p class="note" id="mcc-intro">
+        Manage models across your fleet. Simple Mode keeps everyday controls clear;
+        Advanced and Expert progressively disclose engine-specific settings.
+        Nothing loads, unloads, or restarts until you confirm.
+      </p>
+      <div class="mcc-toolbar">
+        <div class="sort-tabs" id="mcc-machine-filters">
+          <button type="button" class="tab active" data-mcc-machine="all">All machines</button>
+        </div>
+        <input id="mcc-search" class="search-input" type="search"
+               placeholder="search model, engine, machine…" autocomplete="off">
+        <select id="mcc-filter" class="ai-model-select">
+          <option value="all">all models</option>
+          <option value="loaded">loaded</option>
+          <option value="unloaded">unloaded</option>
+          <option value="manageable">manageable</option>
+        </select>
+        <select id="mcc-profile-select" class="ai-model-select" title="Saved profiles (preview only until Apply)">
+          <option value="">— profile —</option>
+        </select>
+        <button type="button" class="btn small" id="mcc-profile-preview">Preview profile</button>
+        <button type="button" class="btn small" id="mcc-profile-new">New profile</button>
+      </div>
+      <div id="mcc-profile-panel" class="mcc-profile-panel note" hidden></div>
+      <div id="mcc-settings-panel" class="mcc-settings-panel" hidden></div>
+      <div id="mcc-cards" class="mcc-grid"></div>
+      <div class="note">
+        Remote Load/Unload require <b>Allow remote control</b> on that machine.
+        llama-server cannot unload a model while leaving the server running — use Restart / Stop.
+      </div>
+    </section>
+  </div>
+
+  <!-- MCC settings / confirm modal -->
+  <div class="modal-overlay" id="mcc-modal" hidden>
+    <div class="modal mcc-modal">
+      <div class="modal-head">
+        <h3 id="mcc-modal-title">Model settings</h3>
+        <button class="tab" id="mcc-modal-close" type="button">✕</button>
+      </div>
+      <div class="modal-body" id="mcc-modal-body"></div>
+      <!-- Placeholder id for static-asset id agreement; rebuilt when Settings opens. -->
+      <select id="mcc-quick-template" hidden aria-hidden="true"></select>
+      <div class="modal-foot">
+        <button class="tab" id="mcc-modal-cancel" type="button">Cancel</button>
+        <button class="tab" id="mcc-modal-save-profile" type="button">Save Profile</button>
+        <button class="tab" id="mcc-modal-apply" type="button">Apply Changes</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== System + local AI servers (this machine OR a fleet machine) ===== -->
   <div id="view-machine">
   <main class="grid">

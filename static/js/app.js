@@ -705,18 +705,33 @@
         + ">Stop</button>");
       controls.push('<button class="btn small" data-act="restart" data-sid="' + esc(sid) + '"'
         + ((caps.can_restart && allowCtl) ? "" : (dis || " disabled")) + ">Restart</button>");
-      if (inst.length || caps.can_load) {
+      if (inst.length || caps.can_load || caps.can_unload) {
+        // Prefer installed list; also offer currently loaded names for unload targets.
+        var opts = {};
+        inst.forEach(function (m) { if (m && m.name) opts[m.name] = m.name; });
+        (loadedList || []).forEach(function (m) {
+          var n = m && (m.name || m.id); if (n) opts[n] = n + " (loaded)";
+        });
+        var optHtml = Object.keys(opts).map(function (k) {
+          return '<option value="' + esc(k) + '">' + esc(opts[k]) + '</option>';
+        }).join("");
         controls.push('<select class="ai-model-select" data-sid="' + esc(sid) + '"'
-          + (remotePeer ? " disabled title='model lists are configured on the machine itself'" : "")
-          + '><option value="">— model —</option>'
-          + inst.map(function (m) {
-              return '<option value="' + esc(m.name) + '">' + esc(m.name) + '</option>';
-            }).join("") + '</select>');
+          + ((remotePeer && !allowCtl)
+            ? " disabled title='enable Allow remote control for this machine first'"
+            : "")
+          + '><option value="">— model —</option>' + optHtml + '</select>');
         controls.push('<button class="btn small" data-act="load" data-sid="' + esc(sid) + '"'
-          + ((caps.can_load && allowCtl && !remotePeer) ? ""
-             : " disabled title='runtime model loading not supported here — use Restart'") + ">Load</button>");
+          + ((caps.can_load && allowCtl) ? ""
+             : " disabled title='" + (caps.can_load
+                ? "enable Allow remote control for this machine first"
+                : "runtime model loading not supported here — use Restart with a selected model") + "'")
+          + ">Load</button>");
         controls.push('<button class="btn small" data-act="unload" data-sid="' + esc(sid) + '"'
-          + ((caps.can_unload && allowCtl && !remotePeer) ? "" : " disabled") + ">Unload</button>");
+          + ((caps.can_unload && allowCtl) ? ""
+             : " disabled title='" + (caps.can_unload
+                ? "enable Allow remote control for this machine first"
+                : "Unload is not supported for this engine — use Stop / Restart") + "'")
+          + ">Unload</button>");
       }
       controls.push('<button class="btn small" data-act="logs" data-sid="' + esc(sid) + '"'
         + (remotePeer ? " disabled title='logs are available on the machine itself'" : "")
@@ -889,6 +904,7 @@
     }
     if (act === "goto-machine") {
       if (fid === "__ALL__") setView("all", null);
+      else if (fid === "__MCC__") setView("mcc", null);
       else setView(fid === "self" ? "self" : "peer", fid === "self" ? null : fid);
       return;
     } else if (act === "add-peer") {
@@ -1078,9 +1094,11 @@
   function showViewContainers(mode) {
     var all = document.getElementById("view-all");
     var mach = document.getElementById("view-machine");
+    var mcc = document.getElementById("view-mcc");
     var head = document.getElementById("machine-view-head");
     if (all) all.hidden = mode !== "all";
     if (mach) mach.hidden = mode !== "machine";
+    if (mcc) mcc.hidden = mode !== "mcc";
     if (head) head.hidden = mode !== "machine" || state.view.mode === "self";
   }
 
@@ -1093,6 +1111,11 @@
       state.peerAllowControl = m ? m.allow_control === true : false;
       state.peerDetail = null;
     }
+    if (mode === "mcc") {
+      showViewContainers("mcc");
+      refreshMCC();
+      return;
+    }
     // immediate re-render from cached data
     if (state.lastData) tickRender(state.lastData, true);
   }
@@ -1100,9 +1123,12 @@
   function tickRender(d, force) {
     state.lastData = d;
     renderMachineTabs(d);
+    if (state.view.mode === "mcc") {
+      showViewContainers("mcc");
+      return;
+    }
     if (state.view.mode === "all") {
-      showViewContainers("all");
-      renderOverview(d);
+      showViewContainers("all");      renderOverview(d);
       renderInventory(d.fleet);
       renderDiscoveryMaybe(d);
       return;
@@ -1130,6 +1156,7 @@
     }
     state._tabsSig = sig;
     var html = '<button class="tab machine-tab" data-act="goto-machine" data-mid="__ALL__" type="button">All Machines</button>'
+      + '<button class="tab machine-tab" data-act="goto-machine" data-mid="__MCC__" type="button">Model Control</button>'
       + '<button class="tab machine-tab" data-act="goto-machine" data-mid="self" type="button">'
       + esc(label) + '</button>';
     html += machines.map(function (m) {
@@ -1146,6 +1173,7 @@
     for (var i = 0; i < tabs.length; i++) {
       var mid = tabs[i].getAttribute("data-mid");
       var active = (state.view.mode === "all" && mid === "__ALL__")
+        || (state.view.mode === "mcc" && mid === "__MCC__")
         || (state.view.mode === "self" && mid === "self")
         || (state.view.mode === "peer" && mid === state.view.machineId);
       tabs[i].className = "tab machine-tab" + (active ? " active" : "");
@@ -1457,6 +1485,470 @@
     });
   }
 
+  /* ================= v3.2: Model Control Center ================= */
+  state.mcc = {
+    mode: "simple",
+    machine: "all",
+    query: "",
+    filter: "all",
+    cards: [],
+    profiles: [],
+    selectedCard: null,
+    pending: {},
+  };
+
+  function mccControlUrl(card, action) {
+    if (card.is_self || !card.machine_id) {
+      return "/api/ai/servers/" + encodeURIComponent(card.server_id) + "/" + action;
+    }
+    return "/api/fleet/" + encodeURIComponent(card.machine_id)
+      + "/ai/servers/" + encodeURIComponent(card.server_id) + "/" + action;
+  }
+
+  function refreshMCC() {
+    var chip = document.getElementById("mcc-status");
+    if (chip) { chip.textContent = "refreshing…"; chip.className = "status-chip warn"; }
+    Promise.all([
+      fetch("/api/mcc/inventory", { cache: "no-store" }).then(function (r) { return r.json(); }),
+      fetch("/api/mcc/profiles", { cache: "no-store" }).then(function (r) { return r.json(); }),
+    ]).then(function (pair) {
+      var inv = pair[0]; var prof = pair[1];
+      state.mcc.cards = (inv.data && inv.data.cards) || [];
+      state.mcc.profiles = (prof.data && prof.data.profiles) || [];
+      state.mcc.templates = (prof.data && prof.data.templates) || [];
+      renderMCCFilters();
+      renderMCCProfiles();
+      renderMCCCards();
+      if (chip) {
+        chip.textContent = state.mcc.cards.length + " model card(s)";
+        chip.className = "status-chip ok";
+      }
+    }).catch(function (err) {
+      if (chip) {
+        chip.textContent = "error: " + (err && err.message ? err.message : err);
+        chip.className = "status-chip err";
+      }
+    });
+  }
+
+  function renderMCCFilters() {
+    var host = document.getElementById("mcc-machine-filters");
+    if (!host) return;
+    var machines = {};
+    state.mcc.cards.forEach(function (c) { machines[c.machine] = true; });
+    var names = Object.keys(machines).sort();
+    var html = '<button type="button" class="tab' + (state.mcc.machine === "all" ? " active" : "")
+      + '" data-mcc-machine="all">All machines</button>';
+    names.forEach(function (n) {
+      html += '<button type="button" class="tab' + (state.mcc.machine === n ? " active" : "")
+        + '" data-mcc-machine="' + esc(n) + '">' + esc(n) + '</button>';
+    });
+    host.innerHTML = html;
+  }
+
+  function renderMCCProfiles() {
+    var sel = document.getElementById("mcc-profile-select");
+    if (!sel) return;
+    var opts = ['<option value="">— profile —</option>'];
+    (state.mcc.profiles || []).forEach(function (p) {
+      opts.push('<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>');
+    });
+    sel.innerHTML = opts.join("");
+  }
+
+  function filteredMCCCards() {
+    var q = (state.mcc.query || "").toLowerCase();
+    var filter = state.mcc.filter || "all";
+    var machine = state.mcc.machine || "all";
+    return (state.mcc.cards || []).filter(function (c) {
+      if (machine !== "all" && c.machine !== machine) return false;
+      if (filter === "loaded" && c.model_status !== "loaded") return false;
+      if (filter === "unloaded" && c.model_status !== "unloaded") return false;
+      if (filter === "manageable" && !(c.actions && (c.actions.load || c.actions.unload || c.actions.restart))) return false;
+      if (!q) return true;
+      var hay = [c.model, c.machine, c.engine, c.server_name, c.endpoint].join(" ").toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+  }
+
+  function renderMCCCards() {
+    var host = document.getElementById("mcc-cards");
+    if (!host) return;
+    var cards = filteredMCCCards();
+    if (!cards.length) {
+      host.innerHTML = '<div class="note">No model cards match this filter.</div>';
+      return;
+    }
+    var mode = state.mcc.mode || "simple";
+    host.innerHTML = cards.map(function (c) {
+      var status = c.model_status === "loaded" ? "Loaded" : (c.model ? "Unloaded" : (c.status || "unknown"));
+      var ctx = c.context_tokens != null ? (Number(c.context_tokens).toLocaleString() + " ctx") : "Context: Unknown — not reported by backend";
+      var mem = [];
+      if (c.ram_bytes != null) mem.push("RAM " + fmtBytes(c.ram_bytes));
+      if (c.vram_bytes != null) mem.push("VRAM " + fmtBytes(c.vram_bytes));
+      if (c.size_bytes != null) mem.push("size " + fmtBytes(c.size_bytes));
+      var res = c.resources || {};
+      if (mode !== "simple") {
+        if (res.ram_available_bytes != null) mem.push("avail RAM " + fmtBytes(res.ram_available_bytes));
+        if (res.vram_total_bytes != null) mem.push("GPU mem " + fmtBytes(res.vram_used_bytes || 0) + "/" + fmtBytes(res.vram_total_bytes));
+      }
+      var btns = [];
+      if (c.actions.load) btns.push('<button class="btn" data-mcc-act="load" data-cid="' + esc(c.id) + '">Load</button>');
+      if (c.actions.unload) btns.push('<button class="btn danger" data-mcc-act="unload" data-cid="' + esc(c.id) + '">Unload</button>');
+      if (c.actions.switch_via_restart) btns.push('<button class="btn" data-mcc-act="switch" data-cid="' + esc(c.id) + '" title="Restart server with this model">Load via Restart</button>');
+      if (c.actions.stop) btns.push('<button class="btn danger" data-mcc-act="stop" data-cid="' + esc(c.id) + '">Stop server</button>');
+      if (c.actions.restart) btns.push('<button class="btn" data-mcc-act="restart" data-cid="' + esc(c.id) + '">Restart server</button>');
+      btns.push('<button class="btn" data-mcc-act="settings" data-cid="' + esc(c.id) + '">Settings</button>');
+      btns.push('<button class="btn" data-mcc-act="details" data-cid="' + esc(c.id) + '">Details</button>');
+      if (!c.actions.load && c.disabled_reasons && c.disabled_reasons.load && c.model && c.model_status !== "loaded") {
+        btns.push('<span class="mini">' + esc(c.disabled_reasons.load) + '</span>');
+      }
+      if (!c.actions.unload && c.disabled_reasons && c.disabled_reasons.unload && c.model_status === "loaded") {
+        btns.push('<span class="mini">' + esc(c.disabled_reasons.unload) + '</span>');
+      }
+      var advanced = "";
+      if (mode === "advanced" || mode === "expert") {
+        advanced = '<div class="mcc-meta">'
+          + '<div><span>Active requests</span><b>' + esc(c.active_requests != null ? c.active_requests : "—") + '</b></div>'
+          + '<div><span>Tok/s</span><b>' + esc(c.tokens_per_sec != null ? c.tokens_per_sec : "—") + '</b></div>'
+          + '<div><span>Endpoint</span><b class="ellip">' + esc(c.endpoint || "—") + '</b></div>'
+          + '<div><span>Remote control</span><b>' + esc(c.is_self ? "local" : (c.allow_control ? "enabled" : "disabled")) + '</b></div>'
+          + '</div>';
+      }
+      if (mode === "expert") {
+        advanced += '<div class="mini">configured args: ' + esc(c.configured_args || "(none / unknown)") + '</div>';
+        advanced += '<div class="mini">engine note: ' + esc((c.capabilities && c.capabilities.notes) || "—") + '</div>';
+      }
+      return '<article class="mcc-card">'
+        + '<div class="mcc-card-top">'
+        + '<h3>' + esc(c.model || "(no model)") + ' — ' + esc(c.machine) + '</h3>'
+        + '<span class="status-chip ' + (c.model_status === "loaded" ? "ok" : "warn") + '">' + esc(status) + '</span>'
+        + '</div>'
+        + '<div class="mcc-sub">Engine: <b>' + esc(c.engine_label || c.engine) + '</b> · '
+        + esc(ctx) + (mem.length ? " · " + mem.join(" · ") : "") + '</div>'
+        + '<div class="mcc-sub">Server: ' + esc(c.server_name || c.server_id || "—")
+        + (c.quantization ? " · " + esc(c.quantization) : "")
+        + (c.parameter_size ? " · " + esc(c.parameter_size) : "") + '</div>'
+        + advanced
+        + '<div class="mcc-actions">' + btns.join("") + '</div>'
+        + '</article>';
+    }).join("");
+  }
+
+  function findMCCCard(cid) {
+    return (state.mcc.cards || []).filter(function (c) { return c.id === cid; })[0];
+  }
+
+  function openMCCSettings(card) {
+    state.mcc.selectedCard = card;
+    state.mcc.pending = {};
+    var title = document.getElementById("mcc-modal-title");
+    if (title) title.textContent = (card.model || "Server") + " · Settings (" + (state.mcc.mode || "simple") + ")";
+    var body = document.getElementById("mcc-modal-body");
+    if (!body) return;
+    var caps = card.capabilities || {};
+    var params = caps.parameters || {};
+    var mode = state.mcc.mode || "simple";
+    var simpleKeys = ["context", "thinking", "temperature", "max_output", "keep_alive"];
+    var html = '<p class="note">Active = verified from the running server. Configured = stored launch settings. Pending = your edits (not applied yet).</p>';
+    html += '<div class="mcc-kv"><div><span>Active model</span><b>' + esc(card.model || "—") + '</b></div>';
+    html += '<div><span>Active context</span><b>' + esc(card.context_tokens != null ? card.context_tokens : "Unknown — not reported by backend") + '</b></div></div>';
+    var keys = Object.keys(params);
+    if (mode === "simple") keys = keys.filter(function (k) { return simpleKeys.indexOf(k) >= 0; });
+    if (mode !== "expert") keys = keys.filter(function (k) { return k !== "launch_args"; });
+    keys.forEach(function (k) {
+      var meta = params[k] || {};
+      if (meta.ui === "none") return;
+      var support = meta.support || "unknown";
+      var apply = meta.apply || "unknown";
+      html += '<label class="mcc-field">' + esc(meta.label || k)
+        + '<span class="mini"> · ' + esc(support) + " · apply: " + esc(apply) + '</span>'
+        + (meta.help ? '<div class="mini">' + esc(meta.help) + '</div>' : "")
+        + (meta.note ? '<div class="mini">' + esc(meta.note) + '</div>' : "");
+      if (support === "unsupported") {
+        html += '<div class="mini">Unsupported on this engine.</div></label>';
+        return;
+      }
+      if (meta.ui === "toggle") {
+        html += '<select data-mcc-param="' + esc(k) + '"><option value="">— leave unchanged —</option>'
+          + '<option value="true">Enabled</option><option value="false">Disabled</option></select>';
+      } else {
+        html += '<input data-mcc-param="' + esc(k) + '" type="text" placeholder="leave blank to keep current">';
+      }
+      html += '</label>';
+    });
+    if (mode === "simple") {
+      html += '<label class="mcc-field">Quick profile template'
+        + '<select id="mcc-quick-template"><option value="">— optional —</option>';
+      (state.mcc.templates || []).forEach(function (t, i) {
+        html += '<option value="' + i + '">' + esc(t.name) + '</option>';
+      });
+      html += '</select><div class="mini">Templates never auto-apply — they only fill pending fields.</div></label>';
+    }
+    body.innerHTML = html;
+    openModal("mcc-modal");
+  }
+
+  function collectMCCPending() {
+    var pending = {};
+    var body = document.getElementById("mcc-modal-body");
+    if (!body) return pending;
+    body.querySelectorAll("[data-mcc-param]").forEach(function (el) {
+      var v = (el.value || "").trim();
+      if (!v) return;
+      if (v === "true") pending[el.getAttribute("data-mcc-param")] = true;
+      else if (v === "false") pending[el.getAttribute("data-mcc-param")] = false;
+      else if (/^-?\d+$/.test(v)) pending[el.getAttribute("data-mcc-param")] = parseInt(v, 10);
+      else if (/^-?\d+\.\d+$/.test(v)) pending[el.getAttribute("data-mcc-param")] = parseFloat(v);
+      else pending[el.getAttribute("data-mcc-param")] = v;
+    });
+    var qt = document.getElementById("mcc-quick-template");
+    if (qt && qt.value !== "") {
+      var t = (state.mcc.templates || [])[parseInt(qt.value, 10)];
+      if (t && t.settings) {
+        Object.keys(t.settings).forEach(function (k) {
+          if (pending[k] === undefined) pending[k] = t.settings[k];
+        });
+      }
+    }
+    return pending;
+  }
+
+  function mccPreviewAndMaybeApply(apply) {
+    var card = state.mcc.selectedCard;
+    if (!card) return;
+    var pending = collectMCCPending();
+    postJSON("/api/mcc/settings/preview", {
+      engine: card.engine,
+      configured_args: card.configured_args,
+      live_context: card.context_tokens,
+      live_model: card.model,
+      pending: pending,
+    }).then(function (res) {
+      var view = (res.body && res.body.data) || {};
+      var lines = (view.changes || []).map(function (ch) {
+        return ch.label + ":\n  Current: " + ch.current + "\n  Requested: " + ch.requested
+          + "\n  (" + ch.apply + ")";
+      });
+      if (!lines.length) {
+        window.alert("No pending changes.");
+        return;
+      }
+      var msg = lines.join("\n\n")
+        + (view.restart_required ? "\n\nRestart required to apply startup settings." : "")
+        + "\n\n" + (apply ? "Apply these changes now?" : "Preview only — nothing applied.");
+      if (!apply) { window.alert(msg); return; }
+      if (!window.confirm(msg)) return;
+      if (view.restart_required) {
+        if (!card.actions.restart) {
+          window.alert("This change needs a restart, but restart is not available for this server (configure/adopt it and enable remote control if needed). Previous configuration was not modified.");
+          return;
+        }
+        if (!window.confirm("Confirm restart of " + (card.server_name || card.server_id)
+          + " on " + card.machine + "?\n\nPrevious launch args are preserved in the server config until you save new args in Configure / Expert Mode.\nThis UI does not silently rewrite launch arguments.")) return;
+        // Safety: do not rewrite args automatically. Expert must edit Configure.
+        window.alert("Restart-required settings must be written into Launch arguments via Configure / Expert Mode, then Restart. Pending request-level prefs were not forced into the server.\n\nNothing was changed automatically.");
+        return;
+      }
+      window.alert("Pending values are request-level preferences. They are not written into Modelfiles or launch args automatically. Use them from AI Lab / clients when sending prompts.\n\nNothing destructive was applied.");
+    });
+  }
+
+  function mccAct(act, cid) {
+    var card = findMCCCard(cid);
+    if (!card) return;
+    if (act === "details") {
+      window.alert(JSON.stringify({
+        machine: card.machine, engine: card.engine, model: card.model,
+        status: card.status, model_status: card.model_status,
+        endpoint: card.endpoint, context_tokens: card.context_tokens,
+        actions: card.actions, disabled_reasons: card.disabled_reasons,
+        resources: card.resources,
+      }, null, 2));
+      return;
+    }
+    if (act === "settings") { openMCCSettings(card); return; }
+    if (!card.server_id) {
+      window.alert("This server is not configured for management. Adopt it on its own machine first.");
+      return;
+    }
+    if (act === "load" || act === "switch") {
+      if (!card.model) { window.alert("No model selected."); return; }
+      // Memory warning (estimate)
+      postJSON("/api/mcc/memory-warning", {
+        model_size_bytes: card.size_bytes,
+        available_ram_bytes: (card.resources || {}).ram_available_bytes,
+        available_vram_bytes: (card.resources || {}).vram_total_bytes,
+        context_tokens: card.context_tokens,
+      }).then(function (res) {
+        var w = (res.body && res.body.data) || {};
+        var proceed = true;
+        if (w.warn) {
+          proceed = window.confirm(
+            "Memory Warning\n\n" + (w.message || "Potential memory pressure")
+            + "\nCurrent available RAM: " + (w.available_ram_bytes != null ? fmtBytes(w.available_ram_bytes) : "Unknown")
+            + "\nEstimated model requirement: " + (w.estimate_bytes != null ? fmtBytes(w.estimate_bytes) : "Unknown")
+            + " (" + (w.estimate_label || "estimate") + ")"
+            + "\nEstimated remaining memory: " + (w.estimated_remaining_bytes != null ? fmtBytes(w.estimated_remaining_bytes) : "Unknown")
+            + "\n\n[Cancel] / OK to Continue Anyway");
+        }
+        if (!proceed) return;
+        if (act === "switch") {
+          if (!window.confirm("Load '" + card.model + "' by restarting "
+            + (card.server_name || "server") + " on " + card.machine
+            + "?\n\nThis stops the current resident model.")) return;
+          postJSON(mccControlUrl(card, "restart"), { force: false, model: card.model }).then(function (r) {
+            if (r.status === 409 && window.confirm((r.body && r.body.message) + "\n\nForce restart?")) {
+              postJSON(mccControlUrl(card, "restart"), { force: true, model: card.model }).then(function (r2) {
+                showResult(r2); setTimeout(refreshMCC, 1500);
+              });
+            } else { showResult(r); setTimeout(refreshMCC, 1500); }
+          });
+          return;
+        }
+        if (!window.confirm("Load model '" + card.model + "' on " + card.machine + "?")) return;
+        postJSON(mccControlUrl(card, "load"), { model: card.model }).then(function (r) {
+          showResult(r); setTimeout(refreshMCC, 1500);
+        });
+      });
+      return;
+    }
+    if (act === "unload") {
+      if (!card.model) return;
+      if (!window.confirm("Unload model '" + card.model + "' on " + card.machine + "?")) return;
+      postJSON(mccControlUrl(card, "unload"), { model: card.model }).then(function (r) {
+        showResult(r); setTimeout(refreshMCC, 1500);
+      });
+      return;
+    }
+    if (act === "stop") {
+      if (!window.confirm("Stop model server on " + card.machine + "? This is Stop server, not Unload model.")) return;
+      postJSON(mccControlUrl(card, "stop"), { force: false }).then(function (r) {
+        if (r.status === 409 && window.confirm((r.body && r.body.message) + "\n\nForce stop?")) {
+          postJSON(mccControlUrl(card, "stop"), { force: true }).then(function (r2) {
+            showResult(r2); setTimeout(refreshMCC, 1500);
+          });
+        } else { showResult(r); setTimeout(refreshMCC, 1500); }
+      });
+      return;
+    }
+    if (act === "restart") {
+      if (!window.confirm("Restart model server on " + card.machine + "?")) return;
+      postJSON(mccControlUrl(card, "restart"), { force: false }).then(function (r) {
+        if (r.status === 409 && window.confirm((r.body && r.body.message) + "\n\nForce restart?")) {
+          postJSON(mccControlUrl(card, "restart"), { force: true }).then(function (r2) {
+            showResult(r2); setTimeout(refreshMCC, 1500);
+          });
+        } else { showResult(r); setTimeout(refreshMCC, 1500); }
+      });
+    }
+  }
+
+  function bindMCC() {
+    document.querySelectorAll(".mcc-mode").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        state.mcc.mode = btn.getAttribute("data-mcc-mode") || "simple";
+        document.querySelectorAll(".mcc-mode").forEach(function (b) {
+          b.classList.toggle("active", b === btn);
+        });
+        renderMCCCards();
+      });
+    });
+    var refresh = document.getElementById("mcc-refresh");
+    if (refresh) refresh.addEventListener("click", refreshMCC);
+    var search = document.getElementById("mcc-search");
+    if (search) search.addEventListener("input", function () {
+      state.mcc.query = search.value || "";
+      renderMCCCards();
+    });
+    var filter = document.getElementById("mcc-filter");
+    if (filter) filter.addEventListener("change", function () {
+      state.mcc.filter = filter.value || "all";
+      renderMCCCards();
+    });
+    var filters = document.getElementById("mcc-machine-filters");
+    if (filters) filters.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-mcc-machine]");
+      if (!btn) return;
+      state.mcc.machine = btn.getAttribute("data-mcc-machine") || "all";
+      renderMCCFilters();
+      renderMCCCards();
+    });
+    var cards = document.getElementById("mcc-cards");
+    if (cards) cards.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-mcc-act]");
+      if (!btn) return;
+      mccAct(btn.getAttribute("data-mcc-act"), btn.getAttribute("data-cid"));
+    });
+    ["mcc-modal-close", "mcc-modal-cancel"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener("click", function () { closeModal("mcc-modal"); });
+    });
+    var apply = document.getElementById("mcc-modal-apply");
+    if (apply) apply.addEventListener("click", function () { mccPreviewAndMaybeApply(true); });
+    var saveProf = document.getElementById("mcc-modal-save-profile");
+    if (saveProf) saveProf.addEventListener("click", function () {
+      var card = state.mcc.selectedCard || {};
+      var pending = collectMCCPending();
+      var name = window.prompt("Profile name", (card.model || "model") + " custom");
+      if (!name) return;
+      postJSON("/api/mcc/profiles", {
+        name: name,
+        engine: card.engine,
+        model: card.model,
+        machine: card.machine,
+        server_id: card.server_id,
+        settings: pending,
+        startup_settings: {},
+        request_settings: pending,
+      }).then(function (r) {
+        showResult(r);
+        refreshMCC();
+      });
+    });
+    var preview = document.getElementById("mcc-profile-preview");
+    if (preview) preview.addEventListener("click", function () {
+      var sel = document.getElementById("mcc-profile-select");
+      var pid = sel && sel.value;
+      if (!pid) { window.alert("Choose a saved profile first."); return; }
+      var card = state.mcc.selectedCard || filteredMCCCards()[0] || {};
+      postJSON("/api/mcc/profiles/" + encodeURIComponent(pid) + "/preview", {
+        engine: card.engine,
+        configured_args: card.configured_args,
+        live_context: card.context_tokens,
+        live_model: card.model,
+      }).then(function (r) {
+        var view = (r.body && r.body.data) || {};
+        var panel = document.getElementById("mcc-profile-panel");
+        if (!panel) return;
+        panel.hidden = false;
+        var lines = (view.changes || []).map(function (ch) {
+          return esc(ch.label) + ": " + esc(String(ch.current)) + " → " + esc(String(ch.requested))
+            + " (" + esc(ch.apply) + ")";
+        });
+        panel.innerHTML = "<b>Profile preview (not applied):</b> "
+          + esc((view.profile && view.profile.name) || "")
+          + "<br>" + (lines.length ? lines.join("<br>") : "No differences from current known settings.")
+          + (view.restart_required ? "<br><b>Restart required</b> to apply startup settings." : "")
+          + "<br><span class='mini'>" + esc(view.note || "") + "</span>";
+      });
+    });
+    var neu = document.getElementById("mcc-profile-new");
+    if (neu) neu.addEventListener("click", function () {
+      var name = window.prompt("New profile name");
+      if (!name) return;
+      postJSON("/api/mcc/profiles", { name: name, settings: {} }).then(function (r) {
+        showResult(r); refreshMCC();
+      });
+    });
+  }
+
   // debug handle (harmless in production, invaluable for diagnosis)
   window.__MONITOR_STATE = state;
+  // Bind MCC after DOM hooks exist
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bindMCC);
+  } else {
+    bindMCC();
+  }
 })();
