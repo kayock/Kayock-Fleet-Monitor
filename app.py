@@ -46,7 +46,7 @@ _werkzeug_log = logging.getLogger("werkzeug")
 _werkzeug_log.setLevel(logging.WARNING)  # avoid a log line every 2 s poll
 
 APP_NAME = "Kayock Fleet Monitor"
-APP_VERSION = "3.3.0-dev"
+APP_VERSION = "3.3.0"
 
 
 def _json_result(ok, message, data=None, status=200):

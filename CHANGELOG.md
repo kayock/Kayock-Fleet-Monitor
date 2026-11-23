@@ -2,11 +2,14 @@
 
 All notable changes to Kayock Fleet Monitor are documented in this file.
 
-## [v3.3.0-dev] — 2026-11-23
+## [v3.3.0] — 2026-11-23
 
-AI Diagnostics & Troubleshooting Center (development branch
-`feature/ai-diagnostics-v3.3`). Read-only by default; does not alter inference
-configurations or restart services.
+AI Diagnostics & Troubleshooting Center deployed on Ubuntu Station from
+`feature/ai-diagnostics-v3.3` (not yet tagged/merged to master). Read-only by
+default; does not alter inference configurations or restart inference services.
+
+Station deploy commit: `3c9acc0` + `APP_VERSION=3.3.0` bump. AI Lab runtime
+`/home/kayock/Applications/FoxaiAiLab` at v1.3.0.
 
 ### Added
 
