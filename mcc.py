@@ -425,6 +425,258 @@ def estimate_memory_warning(*, model_size_bytes: int | None,
     }
 
 
+def stable_model_identity(*, machine: str, machine_id: str | None,
+                          server: dict, model: str | None) -> dict:
+    """Stable identity — never display-name alone."""
+    host = server.get("host") or server.get("lan_host") or ""
+    port = server.get("port")
+    sid = server.get("id") or ""
+    skey = server.get("key") or f"{host}:{port}"
+    mid = (machine_id or machine or "").strip()
+    model_id = (model or "").strip() or "_"
+    # Deterministic key without relying on friendly names.
+    key = f"{mid}|{skey}|{model_id}"
+    return {
+        "key": key,
+        "machine": machine,
+        "machine_id": machine_id,
+        "server_id": sid or None,
+        "server_key": skey,
+        "host": host,
+        "port": port,
+        "model": model if model else None,
+        "endpoint": server.get("url") or (
+            f"http://{host}:{port}" if host and port else None),
+    }
+
+
+def guess_association(model: str | None) -> dict | None:
+    """Evidence-light association hint — always unverified unless confirmed."""
+    if not model:
+        return None
+    m = model.lower()
+    if m.startswith("saturday-gm-") or "gamemaster" in m or "gemmasutra" in m:
+        return {
+            "name": "Saturday Multiverse",
+            "status": "possible_unverified",
+            "label": "Possible association — unverified",
+            "evidence": "model identifier prefix/pattern only",
+        }
+    return None
+
+
+def default_friendly_name(model: str | None, machine: str) -> str:
+    if not model:
+        return f"Server on {machine}"
+    # Keep readable; do not invent marketing names.
+    return model
+
+
+def management_status(*, configured: bool, is_self: bool, allow_control: bool,
+                      caps: dict, server_caps: dict,
+                      server_status: str | None) -> dict:
+    """Clear why a model can/cannot be managed."""
+    if server_status in ("offline", "error") or server_status is None and not configured:
+        # still classify setup needs below
+        pass
+    if not is_self and not allow_control:
+        return {
+            "code": "remote_control_disabled",
+            "label": "Remote control disabled",
+            "detail": "Enable Allow remote control on this fleet machine first.",
+            "needs_setup": True,
+            "manageable": False,
+        }
+    if not configured:
+        return {
+            "code": "setup_required",
+            "label": "Setup required",
+            "detail": "Server is discovered but not adopted/configured for management.",
+            "needs_setup": True,
+            "manageable": False,
+        }
+    if server_status in ("offline",):
+        return {
+            "code": "server_unavailable",
+            "label": "Server unavailable",
+            "detail": "Configured server is offline.",
+            "needs_setup": False,
+            "manageable": False,
+        }
+    can_manage = any([
+        server_caps.get("can_load") and caps.get("can_load"),
+        server_caps.get("can_unload") and caps.get("can_unload"),
+        server_caps.get("can_start"),
+        server_caps.get("can_stop"),
+        server_caps.get("can_restart"),
+        caps.get("model_switch") == "restart_with_model" and server_caps.get("can_restart"),
+    ])
+    if not can_manage and not (caps.get("can_load") or caps.get("can_unload")
+                               or caps.get("model_switch") == "restart_with_model"):
+        return {
+            "code": "backend_unsupported",
+            "label": "Backend unsupported",
+            "detail": caps.get("notes") or "This engine does not support model management here.",
+            "needs_setup": False,
+            "manageable": False,
+        }
+    if can_manage:
+        return {
+            "code": "manageable",
+            "label": "Manageable",
+            "detail": "Authorized management actions are available.",
+            "needs_setup": False,
+            "manageable": True,
+        }
+    return {
+        "code": "monitoring_only",
+        "label": "Monitoring only",
+        "detail": "Server is configured but no model-management actions are available.",
+        "needs_setup": False,
+        "manageable": False,
+    }
+
+
+def management_setup_preview(card: dict) -> dict:
+    """Guided setup preview — never mutates. Caller must confirm before acting."""
+    ms = card.get("management_status") or {}
+    steps = []
+    proposed = []
+    if not card.get("is_self") and not card.get("allow_control"):
+        steps.append("Remote control is disabled for this machine.")
+        proposed.append({
+            "action": "enable_allow_control",
+            "label": "Enable Allow remote control on the fleet machine entry",
+            "automatic": False,
+            "where": "Fleet machine Configure → Allow remote control",
+        })
+    if not card.get("configured"):
+        steps.append("Server is discovered but not adopted for management.")
+        if card.get("is_self"):
+            proposed.append({
+                "action": "adopt_server",
+                "label": "Adopt this local server into ai_servers.json",
+                "automatic": True,
+                "requires": "server_key",
+                "server_key": card.get("server_key"),
+                "note": "Only local loopback servers can be adopted; exe path may still be needed for start/stop.",
+            })
+        else:
+            proposed.append({
+                "action": "adopt_on_peer",
+                "label": "Adopt/configure the server on the peer machine itself",
+                "automatic": False,
+                "note": "Adoption is local-only by design — do it on the peer dashboard.",
+            })
+    caps = card.get("capabilities") or {}
+    if caps.get("model_switch") == "restart_with_model":
+        steps.append("llama-server requires managed restart to switch models (Unload while running is unsupported).")
+    if not proposed and ms.get("manageable"):
+        steps.append("Already manageable — no setup required.")
+    return {
+        "model": card.get("model"),
+        "friendly_name": card.get("friendly_name") or card.get("model"),
+        "machine": card.get("machine"),
+        "engine": card.get("engine"),
+        "endpoint": card.get("endpoint"),
+        "current_status": ms,
+        "explanation": steps,
+        "proposed_actions": proposed,
+        "applies_changes": False,
+        "note": "Preview only — nothing was changed. Confirm an action explicitly to proceed.",
+    }
+
+
+def merge_startup_args(existing: str | None, updates: dict,
+                       engine: str | None) -> tuple[str, list[str]]:
+    """Replace values for known arg keys only; preserve unknown flags/order.
+
+    Returns (new_args_string, list_of_change_notes).
+    """
+    caps = capabilities_for(engine)
+    tokens = split_args(existing)
+    notes: list[str] = []
+    # Map parameter -> arg key preference
+    param_to_keys = {}
+    for pname, meta in (caps.get("parameters") or {}).items():
+        keys = meta.get("arg_keys") or []
+        if keys:
+            param_to_keys[pname] = keys
+
+    # Index existing known flags
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        handled = False
+        for pname, keys in param_to_keys.items():
+            if tok in keys and pname in updates:
+                new_val = updates[pname]
+                if i + 1 < len(tokens) and not str(tokens[i + 1]).startswith("-"):
+                    old = tokens[i + 1]
+                    tokens[i + 1] = str(new_val)
+                    notes.append(f"{pname}: {old} → {new_val} (via {tok})")
+                    i += 2
+                else:
+                    tokens.insert(i + 1, str(new_val))
+                    notes.append(f"{pname}: set {new_val} (via {tok})")
+                    i += 2
+                handled = True
+                # consume update
+                updates = {k: v for k, v in updates.items() if k != pname}
+                break
+        if not handled:
+            i += 1
+
+    # Append missing known params
+    for pname, new_val in list(updates.items()):
+        keys = param_to_keys.get(pname)
+        if not keys:
+            notes.append(f"{pname}: skipped — no known startup flag for this engine")
+            continue
+        tokens.extend([keys[0], str(new_val)])
+        notes.append(f"{pname}: appended {keys[0]} {new_val}")
+
+    # Re-quote tokens with spaces
+    out = []
+    for t in tokens:
+        if any(ch.isspace() for ch in t) and not (t.startswith('"') and t.endswith('"')):
+            out.append(f'"{t}"')
+        else:
+            out.append(t)
+    return " ".join(out), notes
+
+
+def classify_pending_for_apply(engine: str | None, pending: dict) -> dict:
+    """Split pending into request prefs vs restart-required startup vs unsupported."""
+    caps = capabilities_for(engine)
+    request_prefs = {}
+    startup = {}
+    unsupported = {}
+    unknown = {}
+    for key, val in (pending or {}).items():
+        meta = (caps.get("parameters") or {}).get(key) or {}
+        apply = meta.get("apply") or "unknown"
+        support = meta.get("support") or "unknown"
+        if support == "unsupported" or apply == "unsupported":
+            unsupported[key] = {"value": val, "reason": "unsupported by engine"}
+        elif apply == "per_request":
+            request_prefs[key] = val
+        elif apply in ("restart", "reload") or support == "startup":
+            startup[key] = val
+        elif apply == "immediate":
+            # No true immediate global settings implemented yet — treat as request pref save
+            request_prefs[key] = val
+        else:
+            unknown[key] = {"value": val, "reason": f"apply={apply}, support={support}"}
+    return {
+        "request_preferences": request_prefs,
+        "startup_settings": startup,
+        "unsupported": unsupported,
+        "unknown": unknown,
+        "restart_required": bool(startup),
+    }
+
+
 def build_model_cards(*, machine: str, machine_id: str | None,
                       allow_control: bool, is_self: bool,
                       servers: list[dict],
@@ -580,17 +832,37 @@ def _card(**kw) -> dict:
         "quantization": model_meta.get("quantization"),
         "parameter_size": model_meta.get("parameter_size"),
         "size_bytes": model_meta.get("size_bytes"),
-        "context_tokens": model_meta.get("context_tokens") if model_meta.get("context_tokens") is not None else s.get("context_tokens"),
-        "ram_bytes": s.get("ram_bytes"),
-        "vram_bytes": s.get("vram_bytes") if s.get("vram_bytes") is not None else model_meta.get("vram_bytes"),
-        "active_requests": s.get("active_requests"),
-        "tokens_per_sec": s.get("tokens_per_sec"),
+        "context_tokens": model_meta.get("context_tokens") if model_meta.get("context_tokens") is not None else (
+            s.get("context_tokens") if loaded else None),
+        # Never copy server-process RSS onto unloaded model cards.
+        "model_ram_bytes": (model_meta.get("ram_bytes") if loaded else None),
+        "model_vram_bytes": (
+            model_meta.get("vram_bytes") if loaded
+            else None),
+        "server_ram_bytes": s.get("ram_bytes"),
+        "server_vram_bytes": s.get("vram_bytes"),
+        # Backward-compatible aliases used carefully by UI:
+        "ram_bytes": (model_meta.get("ram_bytes") if loaded else None),
+        "vram_bytes": (model_meta.get("vram_bytes") if loaded else (
+            s.get("vram_bytes") if loaded else None)),
+        "active_requests": s.get("active_requests") if loaded else None,
+        "tokens_per_sec": s.get("tokens_per_sec") if loaded else None,
         "configured": kw["configured"],
         "capabilities": caps,
         "server_capabilities": server_caps,
         "actions": actions,
         "disabled_reasons": disabled_reasons,
+        "management_status": management_status(
+            configured=kw["configured"], is_self=kw["is_self"],
+            allow_control=kw["allow_control"], caps=caps,
+            server_caps=server_caps, server_status=s.get("status")),
         "resources": {
+            "machine_ram_used_bytes": kw["used_ram"],
+            "machine_ram_available_bytes": kw["avail_ram"],
+            "machine_ram_total_bytes": kw["total_ram"],
+            "machine_vram_used_bytes": kw["vram_used"],
+            "machine_vram_total_bytes": kw["vram_total"],
+            # legacy keys kept for older callers
             "ram_used_bytes": kw["used_ram"],
             "ram_available_bytes": kw["avail_ram"],
             "ram_total_bytes": kw["total_ram"],
@@ -599,7 +871,20 @@ def _card(**kw) -> dict:
         },
         "ops": s.get("ops"),
         "configured_args": (s.get("config") or {}).get("args") if isinstance(s.get("config"), dict) else None,
+        "identity": stable_model_identity(
+            machine=kw["machine"], machine_id=kw["machine_id"],
+            server=s, model=kw["model_name"]),
     }
+
+
+# Discovery metadata keys that sync may refresh without touching user prefs.
+_SYNC_DISCOVERY_KEYS = (
+    "model", "engine", "machine", "machine_id", "server_id", "server_key",
+    "endpoint", "model_path", "quantization", "parameter_size", "size_bytes",
+    "detected_context", "configured_context", "configured_args",
+    "model_status", "management_status", "identity", "last_seen_at",
+    "available",
+)
 
 
 class ProfileStore:
@@ -630,7 +915,7 @@ class ProfileStore:
     def _save(self) -> None:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "profiles": self._profiles}, fh, indent=2)
+            json.dump({"version": 2, "profiles": self._profiles}, fh, indent=2)
         os.replace(tmp, self.path)
 
     def list_profiles(self) -> list[dict]:
@@ -647,25 +932,87 @@ class ProfileStore:
                     return deepcopy(p)
         return None
 
+    def get_by_identity(self, identity_key: str) -> dict | None:
+        with self._lock:
+            for p in self._profiles:
+                if (p.get("identity") or {}).get("key") == identity_key:
+                    return deepcopy(p)
+        return None
+
     def save(self, entry: dict) -> tuple[bool, str, dict | None]:
         with self._lock:
-            name = (entry.get("name") or "").strip()
+            name = (entry.get("name") or entry.get("friendly_name") or "").strip()
             if not name:
                 return False, "profile name is required", None
             pid = (entry.get("id") or "").strip() or uuid.uuid4().hex[:12]
             now = time.time()
             existing = next((p for p in self._profiles if p.get("id") == pid), None)
+            # If identity provided, also find by identity to avoid duplicates
+            ident = entry.get("identity") or {}
+            if not existing and ident.get("key"):
+                existing = next(
+                    (p for p in self._profiles
+                     if (p.get("identity") or {}).get("key") == ident["key"]),
+                    None)
+                if existing:
+                    pid = existing["id"]
+
             profile = {
                 "id": pid,
                 "name": name,
-                "description": entry.get("description") or "",
-                "engine": entry.get("engine") or "",
-                "model": entry.get("model") or "",
-                "machine": entry.get("machine") or "",
-                "server_id": entry.get("server_id") or "",
-                "startup_settings": entry.get("startup_settings") or {},
-                "request_settings": entry.get("request_settings") or {},
-                "settings": entry.get("settings") or {},
+                "friendly_name": entry.get("friendly_name") or name,
+                "description": entry.get("description") if entry.get("description") is not None
+                    else (existing or {}).get("description") or "",
+                "engine": entry.get("engine") or (existing or {}).get("engine") or "",
+                "model": entry.get("model") or (existing or {}).get("model") or "",
+                "machine": entry.get("machine") or (existing or {}).get("machine") or "",
+                "machine_id": entry.get("machine_id") if "machine_id" in entry
+                    else (existing or {}).get("machine_id"),
+                "server_id": entry.get("server_id") if "server_id" in entry
+                    else (existing or {}).get("server_id") or "",
+                "server_key": entry.get("server_key") if "server_key" in entry
+                    else (existing or {}).get("server_key"),
+                "endpoint": entry.get("endpoint") if "endpoint" in entry
+                    else (existing or {}).get("endpoint"),
+                "identity": entry.get("identity") or (existing or {}).get("identity") or {},
+                "model_path": entry.get("model_path") if "model_path" in entry
+                    else (existing or {}).get("model_path"),
+                "quantization": entry.get("quantization") if "quantization" in entry
+                    else (existing or {}).get("quantization"),
+                "parameter_size": entry.get("parameter_size") if "parameter_size" in entry
+                    else (existing or {}).get("parameter_size"),
+                "size_bytes": entry.get("size_bytes") if "size_bytes" in entry
+                    else (existing or {}).get("size_bytes"),
+                "detected_context": entry.get("detected_context") if "detected_context" in entry
+                    else (existing or {}).get("detected_context"),
+                "configured_context": entry.get("configured_context") if "configured_context" in entry
+                    else (existing or {}).get("configured_context"),
+                "configured_args": entry.get("configured_args") if "configured_args" in entry
+                    else (existing or {}).get("configured_args"),
+                "model_status": entry.get("model_status") if "model_status" in entry
+                    else (existing or {}).get("model_status"),
+                "management_status": entry.get("management_status") if "management_status" in entry
+                    else (existing or {}).get("management_status"),
+                "startup_settings": entry.get("startup_settings") if "startup_settings" in entry
+                    else (existing or {}).get("startup_settings") or {},
+                "request_settings": entry.get("request_settings") if "request_settings" in entry
+                    else (existing or {}).get("request_settings") or {},
+                "settings": entry.get("settings") if "settings" in entry
+                    else (existing or {}).get("settings") or {},
+                "associations": entry.get("associations") if "associations" in entry
+                    else (existing or {}).get("associations") or [],
+                "protected": bool(entry["protected"]) if "protected" in entry
+                    else bool((existing or {}).get("protected")),
+                "tags": entry.get("tags") if "tags" in entry
+                    else (existing or {}).get("tags") or [],
+                "notes": entry.get("notes") if "notes" in entry
+                    else (existing or {}).get("notes") or "",
+                "user_customized": bool((existing or {}).get("user_customized"))
+                    or bool(entry.get("user_customized")),
+                "available": entry.get("available") if "available" in entry
+                    else (existing or {}).get("available", True),
+                "last_seen_at": entry.get("last_seen_at") if "last_seen_at" in entry
+                    else (existing or {}).get("last_seen_at"),
                 "updated_at": now,
                 "created_at": (existing or {}).get("created_at", now),
             }
@@ -679,6 +1026,170 @@ class ProfileStore:
             except OSError as exc:
                 return False, f"save failed: {exc}", None
             return True, "saved", deepcopy(profile)
+
+    def patch_user_fields(self, profile_id: str, fields: dict) -> tuple[bool, str, dict | None]:
+        """Update user-facing fields without clobbering discovery metadata."""
+        allowed = {
+            "friendly_name", "name", "description", "notes", "tags",
+            "protected", "associations", "startup_settings",
+            "request_settings", "settings",
+        }
+        with self._lock:
+            existing = next((p for p in self._profiles if p.get("id") == profile_id), None)
+            if not existing:
+                return False, "unknown profile id", None
+            merged = deepcopy(existing)
+            for k, v in (fields or {}).items():
+                if k in allowed:
+                    merged[k] = v
+            if "friendly_name" in fields and fields["friendly_name"]:
+                merged["name"] = fields["friendly_name"]
+            merged["user_customized"] = True
+            return self.save(merged)
+
+    def sync_from_cards(self, cards: list[dict]) -> dict:
+        """Non-destructive inventory sync — create/update discovery metadata only."""
+        summary = {
+            "created": 0, "updated": 0, "unchanged": 0,
+            "unavailable": 0, "conflicts": [], "total_cards": 0,
+        }
+        seen_keys = set()
+        now = time.time()
+        with self._lock:
+            by_ident = {
+                (p.get("identity") or {}).get("key"): p
+                for p in self._profiles
+                if (p.get("identity") or {}).get("key")
+            }
+            for card in cards or []:
+                if not card.get("model"):
+                    continue  # skip server-only placeholders
+                summary["total_cards"] += 1
+                ident = card.get("identity") or stable_model_identity(
+                    machine=card.get("machine") or "",
+                    machine_id=card.get("machine_id"),
+                    server={
+                        "id": card.get("server_id"),
+                        "key": card.get("server_key"),
+                        "host": (card.get("endpoint") or "").replace("http://", "").split(":")[0]
+                        if card.get("endpoint") else "",
+                        "port": card.get("port"),
+                        "url": card.get("endpoint"),
+                    },
+                    model=card.get("model"),
+                )
+                key = ident.get("key")
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                configured = parse_startup_settings(
+                    card.get("engine"), card.get("configured_args"))
+                assoc = guess_association(card.get("model"))
+                associations = []
+                if assoc:
+                    associations.append(assoc)
+
+                existing = by_ident.get(key)
+                if not existing:
+                    profile = {
+                        "id": uuid.uuid4().hex[:12],
+                        "name": default_friendly_name(card.get("model"), card.get("machine") or ""),
+                        "friendly_name": default_friendly_name(
+                            card.get("model"), card.get("machine") or ""),
+                        "description": "",
+                        "engine": card.get("engine"),
+                        "model": card.get("model"),
+                        "machine": card.get("machine"),
+                        "machine_id": card.get("machine_id"),
+                        "server_id": card.get("server_id"),
+                        "server_key": card.get("server_key"),
+                        "endpoint": card.get("endpoint"),
+                        "identity": ident,
+                        "model_path": card.get("model_path"),
+                        "quantization": card.get("quantization"),
+                        "parameter_size": card.get("parameter_size"),
+                        "size_bytes": card.get("size_bytes"),
+                        "detected_context": card.get("context_tokens"),
+                        "configured_context": configured.get("context"),
+                        "configured_args": card.get("configured_args"),
+                        "model_status": card.get("model_status"),
+                        "management_status": card.get("management_status"),
+                        "startup_settings": {},
+                        "request_settings": {},
+                        "settings": {},
+                        "associations": associations,
+                        "protected": False,
+                        "tags": [],
+                        "notes": "",
+                        "user_customized": False,
+                        "available": True,
+                        "last_seen_at": now,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    self._profiles.append(profile)
+                    by_ident[key] = profile
+                    summary["created"] += 1
+                    continue
+
+                # Update discovery metadata only; preserve user fields.
+                # last_seen_at always refreshes and does not count as "updated".
+                changed = False
+                discovery = {
+                    "model": card.get("model"),
+                    "engine": card.get("engine"),
+                    "machine": card.get("machine"),
+                    "machine_id": card.get("machine_id"),
+                    "server_id": card.get("server_id"),
+                    "server_key": card.get("server_key"),
+                    "endpoint": card.get("endpoint"),
+                    "identity": ident,
+                    "model_path": card.get("model_path"),
+                    "quantization": card.get("quantization"),
+                    "parameter_size": card.get("parameter_size"),
+                    "size_bytes": card.get("size_bytes"),
+                    "detected_context": card.get("context_tokens"),
+                    "configured_context": configured.get("context"),
+                    "configured_args": card.get("configured_args"),
+                    "model_status": card.get("model_status"),
+                    "management_status": card.get("management_status"),
+                    "available": True,
+                }
+                for k, v in discovery.items():
+                    if existing.get(k) != v:
+                        existing[k] = v
+                        changed = True
+                existing["last_seen_at"] = now
+                # Merge unverified associations if user has none
+                if associations and not existing.get("associations"):
+                    existing["associations"] = associations
+                    changed = True
+                if not existing.get("friendly_name"):
+                    existing["friendly_name"] = existing.get("name") or default_friendly_name(
+                        card.get("model"), card.get("machine") or "")
+                    changed = True
+                if changed:
+                    existing["updated_at"] = now
+                    summary["updated"] += 1
+                else:
+                    summary["unchanged"] += 1
+
+            # Mark missing as unavailable — never delete
+            for p in self._profiles:
+                key = (p.get("identity") or {}).get("key")
+                if key and key not in seen_keys and p.get("model"):
+                    if p.get("available") is not False:
+                        p["available"] = False
+                        p["updated_at"] = now
+                        summary["unavailable"] += 1
+                    else:
+                        summary["unchanged"] += 1
+
+            try:
+                self._save()
+            except OSError as exc:
+                summary["conflicts"].append(f"save failed: {exc}")
+        return summary
 
     def delete(self, profile_id: str) -> tuple[bool, str]:
         with self._lock:
@@ -697,12 +1208,19 @@ class ProfileStore:
         if not src:
             return False, "unknown profile id", None
         src.pop("id", None)
-        src["name"] = new_name or (src.get("name") + " copy")
+        # Duplicates get a new identity suffix so they don't collide on sync
+        ident = dict(src.get("identity") or {})
+        if ident.get("key"):
+            ident["key"] = ident["key"] + "|copy|" + uuid.uuid4().hex[:6]
+        src["identity"] = ident
+        src["name"] = new_name or ((src.get("friendly_name") or src.get("name") or "profile") + " copy")
+        src["friendly_name"] = src["name"]
+        src["user_customized"] = True
         return self.save(src)
 
     def export_all(self) -> dict:
         with self._lock:
-            return {"version": 1, "profiles": deepcopy(self._profiles),
+            return {"version": 2, "profiles": deepcopy(self._profiles),
                     "exported_at": time.time()}
 
     def import_all(self, payload: dict | list, *, merge: bool = True) -> tuple[bool, str, int]:
@@ -727,6 +1245,47 @@ class ProfileStore:
         return True, f"imported {count} profile(s)", count
 
 
+def attach_profiles_to_cards(cards: list[dict], profiles: list[dict]) -> list[dict]:
+    by_key = {(p.get("identity") or {}).get("key"): p for p in profiles
+              if (p.get("identity") or {}).get("key")}
+    out = []
+    for c in cards:
+        c2 = dict(c)
+        ident = c.get("identity") or stable_model_identity(
+            machine=c.get("machine") or "",
+            machine_id=c.get("machine_id"),
+            server={
+                "id": c.get("server_id"),
+                "key": c.get("server_key"),
+                "host": "",
+                "port": None,
+                "url": c.get("endpoint"),
+            },
+            model=c.get("model"),
+        )
+        c2["identity"] = ident
+        key = ident.get("key")
+        prof = by_key.get(key)
+        if prof:
+            c2["profile_id"] = prof.get("id")
+            c2["friendly_name"] = prof.get("friendly_name") or prof.get("name") or c.get("model")
+            c2["protected"] = bool(prof.get("protected"))
+            c2["tags"] = prof.get("tags") or []
+            c2["associations"] = prof.get("associations") or []
+            c2["notes"] = prof.get("notes") or ""
+            c2["request_settings"] = prof.get("request_settings") or {}
+            c2["startup_settings"] = prof.get("startup_settings") or {}
+        else:
+            c2["friendly_name"] = c.get("model")
+            c2["protected"] = False
+            c2["tags"] = []
+            c2["associations"] = []
+            if guess_association(c.get("model")):
+                c2["associations"] = [guess_association(c.get("model"))]
+        out.append(c2)
+    return out
+
+
 def preview_apply_profile(profile: dict, *, engine: str | None,
                           configured_args: str | None,
                           live_context: Any = None,
@@ -741,7 +1300,9 @@ def preview_apply_profile(profile: dict, *, engine: str | None,
                          live_context=live_context,
                          live_model=live_model or profile.get("model"),
                          pending=pending)
-    view["profile"] = {"id": profile.get("id"), "name": profile.get("name")}
+    view["profile"] = {"id": profile.get("id"), "name": profile.get("friendly_name") or profile.get("name")}
     view["applied"] = False
+    view["classification"] = classify_pending_for_apply(
+        engine or profile.get("engine"), pending)
     view["note"] = "Preview only — nothing was applied."
     return view
