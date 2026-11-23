@@ -1181,9 +1181,10 @@ class AIManager:
             "name": rec.get("name") or f"AI server @{port}",
             "type": rec.get("type") or "openai",
             "host": host, "port": port,
-            # exe left empty unless discovery already knows it — avoids
-            # implying process-control rights we do not have.
-            "exe": rec.get("exe") or "",
+            # Never copy discovery exe/args into a new registration.
+            # Process-control rights require an explicit Configure step so we
+            # do not adopt unrelated PIDs (e.g. ssh) by accident.
+            "exe": "",
             "args": "", "model_dir": "",
         })
 

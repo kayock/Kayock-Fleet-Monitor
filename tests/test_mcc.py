@@ -710,10 +710,13 @@ def test_adopt_server_idempotent_preserves_config(tmp_path):
             "key": "127.0.0.1:11434", "host": "127.0.0.1", "port": 11434,
             "type": "ollama", "name": "ollama", "status": "online",
         }]
+    with mgr._lock:
+        mgr._records[0]["exe"] = "/usr/bin/ssh"  # discovery noise must not grant process control
     ok, msg, warnings = mgr.adopt_server("127.0.0.1:11434")
     assert ok, msg
     saved = json.loads(cfg.read_text(encoding="utf-8"))
     assert len(saved) == 1
+    assert saved[0].get("exe") == ""
     saved[0]["args"] = "--keep-me"
     saved[0]["exe"] = "/usr/bin/ollama"
     cfg.write_text(json.dumps(saved), encoding="utf-8")
